@@ -1,8 +1,12 @@
 // Service worker: the only component that talks to the aggregator. host_permissions
 // for localhost:7331 let these fetches bypass page CORS. Fire-and-forget; failures
-// (aggregator down) are swallowed so browsing is never affected.
+// (aggregator down) are logged but never affect browsing.
 
-const DEFAULT_AGG = "http://localhost:7331";
+// Use 127.0.0.1 (not "localhost"): the aggregator binds IPv4, but browsers often
+// resolve "localhost" to ::1 (IPv6) first, which would silently fail to connect.
+const DEFAULT_AGG = "http://127.0.0.1:7331";
+
+const LOG = "[ctf-brain bg]";
 
 async function aggUrl() {
   try {
@@ -16,22 +20,27 @@ async function aggUrl() {
 async function post(path, body) {
   const base = await aggUrl();
   try {
-    await fetch(base + path, {
+    const res = await fetch(base + path, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-  } catch (_) {
-    // Aggregator not running — ignore.
+    console.debug(`${LOG} POST ${base}${path} -> ${res.status}`);
+  } catch (e) {
+    console.warn(`${LOG} POST ${base}${path} FAILED:`, e.message);
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+console.log(`${LOG} service worker started; aggregator = ${DEFAULT_AGG}`);
+
+chrome.runtime.onMessage.addListener((msg, sender) => {
   if (!msg || !msg.type) return;
+  const from = sender.tab ? sender.tab.url : "?";
   if (msg.type === "snapshot") {
+    console.debug(`${LOG} snapshot from ${from} url=${msg.data && msg.data.url}`);
     post("/browser", msg.data);
   } else if (msg.type === "xhr") {
+    console.debug(`${LOG} xhr ${msg.data && msg.data.method} ${msg.data && msg.data.url}`);
     post("/xhr", msg.data);
   }
-  // No async response needed.
 });

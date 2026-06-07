@@ -33,11 +33,13 @@ class State:
     def set_browser(self, snap: dict[str, Any]) -> None:
         snap = dict(snap)
         snap["timestamp_recv"] = time.time()
-        # Keep a small rolling window of XHR/fetch events across snapshots.
         with self._lock:
-            prev = (self.browser or {}).get("xhr", []) if self.browser else []
+            prev = self.browser or {}
+            # Keep the rolling request window only while we're on the same page;
+            # navigating away clears stale requests (e.g. another tab's traffic).
+            same_page = prev.get("url") and prev.get("url") == snap.get("url")
+            xhr = list(prev.get("xhr", [])) if same_page else []
             new = snap.pop("xhr_events", None)
-            xhr = list(prev)
             if new:
                 xhr.extend(new)
             snap["xhr"] = xhr[-30:]

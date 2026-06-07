@@ -191,8 +191,11 @@ async function poll() {
     pill($("p-active"), null, "active <b>" + (s.active_pane || "—") + "</b>");
     pill($("p-browser"), s.browser_fresh, "browser <b>" +
       (s.browser_url ? new URL(s.browser_url).host : "—") + "</b>");
-    pill($("p-shot"), s.screenshot_pending ? true : null,
-      "shot <b>" + (s.screenshot_pending ? "pending" : (h.screenshot_backend || "n/a")) + "</b>");
+    pill($("p-shot"),
+      s.screenshot_pending ? true : (h.screenshot_working ? null : false),
+      "shot <b>" + (s.screenshot_pending ? "pending"
+        : h.screenshot_working ? h.screenshot_backend
+        : (h.screenshot_backend ? h.screenshot_backend + " (broken)" : "n/a")) + "</b>");
   } catch (_) {
     pill($("p-api"), false, "aggregator <b>offline</b>");
   }

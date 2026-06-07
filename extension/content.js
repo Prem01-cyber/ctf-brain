@@ -7,6 +7,28 @@
   "use strict";
 
   const SNAPSHOT_INTERVAL_MS = 3000;
+  const LOG = "[ctf-brain cs]";
+
+  // Don't snapshot the ctf-brain UI itself — otherwise viewing the chat tab
+  // would overwrite the target page's context with the aggregator's own URL.
+  const AGG_HOSTS = ["127.0.0.1:7331", "localhost:7331"];
+  let aggHostExtra = null;
+  try {
+    chrome.storage.local.get("aggUrl", ({ aggUrl }) => {
+      if (aggUrl) {
+        try {
+          aggHostExtra = new URL(aggUrl).host;
+        } catch (_) {
+          /* ignore */
+        }
+      }
+    });
+  } catch (_) {
+    /* extension context */
+  }
+  function isAggregator() {
+    return AGG_HOSTS.includes(location.host) || location.host === aggHostExtra;
+  }
 
   function snapshot() {
     let selected = "";
@@ -33,9 +55,11 @@
     }
   }
 
-  // Relay request events from the MAIN-world hook.
+  // Relay request events from the MAIN-world hook — but never from the
+  // aggregator's own UI tab (its /health & /status polling is not target traffic).
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
+    if (isAggregator()) return;
     const d = event.data;
     if (!d || d.source !== "ctfbrain-inject" || !d.payload) return;
     send({ type: "xhr", data: d.payload });
@@ -44,10 +68,18 @@
   // Send a snapshot promptly, then on an interval. Skip when tab is hidden to
   // avoid spamming stale background tabs.
   function tick() {
-    if (document.visibilityState === "visible") {
-      send({ type: "snapshot", data: snapshot() });
+    if (isAggregator()) {
+      return; // never report the ctf-brain UI tab itself
     }
+    if (document.visibilityState !== "visible") {
+      return; // only snapshot the foreground tab
+    }
+    const snap = snapshot();
+    console.debug(`${LOG} sending snapshot for ${snap.url}`);
+    send({ type: "snapshot", data: snap });
   }
+
+  console.log(`${LOG} loaded on ${location.host} (aggregator tab: ${isAggregator()})`);
   tick();
   setInterval(tick, SNAPSHOT_INTERVAL_MS);
   document.addEventListener("visibilitychange", tick);

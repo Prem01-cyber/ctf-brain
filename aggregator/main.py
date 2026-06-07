@@ -46,6 +46,7 @@ async def health() -> dict[str, Any]:
         "api_key": llm.has_api_key(),
         "providers": {name: p.available() for name, p in providers._REGISTRY.items()},
         "screenshot_backend": screenshot.available_backend(),
+        "screenshot_working": await asyncio.to_thread(screenshot.probe),
     }
 
 

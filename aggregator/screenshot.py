@@ -34,6 +34,21 @@ def available_backend() -> str | None:
     return None
 
 
+_probe_cache: bool | None = None
+
+
+def probe(force: bool = False) -> bool:
+    """Whether capture actually *works* here (cached after the first attempt).
+
+    A binary existing (e.g. ImageMagick `import`) doesn't mean it can grab the
+    screen — X11 tools fail on Wayland. This does one real capture to find out.
+    """
+    global _probe_cache
+    if _probe_cache is None or force:
+        _probe_cache = capture() is not None
+    return _probe_cache
+
+
 def capture() -> bytes | None:
     """Capture the screen and return PNG bytes, or None if no backend works."""
     fd, path = tempfile.mkstemp(suffix=".png", prefix="ctf_snap_")
