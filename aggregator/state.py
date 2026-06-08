@@ -42,6 +42,11 @@ class State:
         self.notes: list[dict[str, Any]] = []
         self.tasks: list[dict[str, Any]] = []
         self.flags: list[str] = []
+        # Accumulating knowledge base, auto-populated by the extraction pipeline.
+        self.hosts: dict[str, dict[str, Any]] = {}      # host -> {ports, os, hostname}
+        self.artifacts: list[dict[str, Any]] = []        # hashes/creds/emails, deduped
+        self._artifact_keys: set[str] = set()
+        self._last_pane_hash: str | None = None
         self._counter = 0
         self._dirty = False
 
@@ -81,28 +86,95 @@ class State:
         with self._lock:
             self.screenshot = {"data": b64, "captured": time.time()} if b64 else None
 
+    def _add_findings_unlocked(self, findings: list[dict[str, Any]]) -> int:
+        added = 0
+        for f in findings:
+            key = f.get("key")
+            if key and key in self._finding_keys:
+                continue
+            if key:
+                self._finding_keys.add(key)
+            f["count"] = 1
+            self.findings.append(f)
+            added += 1
+            self._dirty = True
+        if len(self.findings) > self._max_findings:
+            drop = self.findings[: len(self.findings) - self._max_findings]
+            self.findings = self.findings[-self._max_findings:]
+            for d in drop:
+                self._finding_keys.discard(d.get("key"))
+        return added
+
+    def add_findings(self, findings: list[dict[str, Any]]) -> int:
+        """Add findings not tied to a flow (e.g. hashes pulled from terminal output)."""
+        with self._lock:
+            return self._add_findings_unlocked(findings)
+
     def add_flow(self, summary: dict[str, Any], findings: list[dict[str, Any]]) -> int:
         """Record a flow summary + its (deduped) findings. Returns new-finding count."""
-        added = 0
         with self._lock:
             self.flows.append(summary)
-            for f in findings:
-                key = f.get("key")
-                if key and key in self._finding_keys:
-                    continue
-                if key:
-                    self._finding_keys.add(key)
-                f["count"] = 1
-                self.findings.append(f)
-                added += 1
+            return self._add_findings_unlocked(findings)
+
+    def merge_hosts(self, hosts: list[dict[str, Any]]) -> int:
+        """Merge parsed nmap hosts into the knowledge base (idempotent)."""
+        new = 0
+        with self._lock:
+            for h in hosts:
+                key = h.get("host") or "unknown"
+                cur = self.hosts.setdefault(
+                    key, {"host": key, "hostname": h.get("hostname", ""), "ports": {}, "os": ""})
+                if h.get("hostname"):
+                    cur["hostname"] = h["hostname"]
+                if h.get("os"):
+                    cur["os"] = h["os"]
+                for pk, p in h.get("ports", {}).items():
+                    if pk not in cur["ports"]:
+                        new += 1
+                    cur["ports"][pk] = p
+            if new or hosts:
                 self._dirty = True
-            # Cap memory: drop oldest findings (keep newest).
-            if len(self.findings) > self._max_findings:
-                drop = self.findings[: len(self.findings) - self._max_findings]
-                self.findings = self.findings[-self._max_findings:]
+        return new
+
+    def add_artifacts(self, artifacts: list[dict[str, Any]]) -> int:
+        new = 0
+        with self._lock:
+            for a in artifacts:
+                key = f"{a['type']}|{a['value']}"
+                if key in self._artifact_keys:
+                    continue
+                self._artifact_keys.add(key)
+                a["t"] = time.time()
+                self.artifacts.append(a)
+                new += 1
+                self._dirty = True
+            if len(self.artifacts) > 1000:
+                drop = self.artifacts[:len(self.artifacts) - 1000]
+                self.artifacts = self.artifacts[-1000:]
                 for d in drop:
-                    self._finding_keys.discard(d.get("key"))
-        return added
+                    self._artifact_keys.discard(f"{d['type']}|{d['value']}")
+        return new
+
+    def pane_text_changed(self, text: str) -> bool:
+        """True if the combined pane text differs from last time (cheap skip)."""
+        import hashlib
+        h = hashlib.md5(text.encode("utf-8", "replace")).hexdigest()
+        with self._lock:
+            if h == self._last_pane_hash:
+                return False
+            self._last_pane_hash = h
+            return True
+
+    def get_hosts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [
+                {"host": h["host"], "hostname": h.get("hostname", ""), "os": h.get("os", ""),
+                 "ports": sorted(h["ports"].values(), key=lambda p: int(p["port"]))}
+                for h in self.hosts.values()]
+
+    def get_artifacts(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self.artifacts)
 
     def update_inventory(self, flow: dict[str, Any]) -> None:
         url = flow.get("url", "")
@@ -183,6 +255,11 @@ class State:
                 "flows": list(self.flows),
                 "findings": list(self.findings),
                 "inventory": self._inventory_unlocked(),
+                "hosts": [
+                    {"host": h["host"], "hostname": h.get("hostname", ""), "os": h.get("os", ""),
+                     "ports": sorted(h["ports"].values(), key=lambda p: int(p["port"]))}
+                    for h in self.hosts.values()],
+                "artifacts": list(self.artifacts),
                 "notes": list(self.notes),
                 "tasks": list(self.tasks),
                 "flags": list(self.flags),
@@ -273,6 +350,8 @@ class State:
             "params": sorted(self.params),
             "links": sorted(self.links),
             "flows_full": list(self.flows_full),
+            "hosts": list(self.hosts.values()),
+            "artifacts": list(self.artifacts),
             "notes": list(self.notes),
             "tasks": list(self.tasks),
             "flags": list(self.flags),
@@ -293,6 +372,14 @@ class State:
         self.params = set(d.get("params", []))
         self.links = set(d.get("links", []))
         self.flows_full = deque(d.get("flows_full", []), maxlen=80)
+        self.hosts = {h["host"]: {"host": h["host"], "hostname": h.get("hostname", ""),
+                                  "os": h.get("os", ""),
+                                  "ports": {pk: pv for pk, pv in
+                                            (h["ports"].items() if isinstance(h.get("ports"), dict)
+                                             else {f"{p['port']}/{p['proto']}": p for p in h.get("ports", [])}.items())}}
+                      for h in d.get("hosts", [])}
+        self.artifacts = d.get("artifacts", [])
+        self._artifact_keys = {f"{a['type']}|{a['value']}" for a in self.artifacts}
         self.notes = d.get("notes", [])
         self.tasks = d.get("tasks", [])
         self.flags = d.get("flags", [])
@@ -334,6 +421,8 @@ class State:
             self.flows_full.clear()
             self.findings, self._finding_keys = [], set()
             self.flows.clear()
+            self.hosts, self.artifacts, self._artifact_keys = {}, [], set()
+            self._last_pane_hash = None
             self.notes, self.tasks, self.flags = [], [], []
             self.scope, self._counter = [], 0
             self.session = name
@@ -375,6 +464,8 @@ class State:
                 "notes": len(self.notes),
                 "tasks": len(self.tasks),
                 "flags": len(self.flags),
+                "hosts": len(self.hosts),
+                "artifacts": len(self.artifacts),
                 "last_pane_update": self.last_pane_update,
             }
 

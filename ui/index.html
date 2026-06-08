@@ -113,12 +113,20 @@
         <div id="d-checklist" class="checklist"></div>
       </div>
       <div class="card">
+        <div class="card-h">HOSTS / SERVICES</div>
+        <div id="d-hosts" class="assets">—</div>
+      </div>
+      <div class="card">
         <div class="card-h">NEXT STEPS <span class="muted">(click to load)</span></div>
         <div id="d-steps">—</div>
       </div>
       <div class="card">
         <div class="card-h">ASSETS</div>
         <div id="d-assets" class="assets">—</div>
+      </div>
+      <div class="card">
+        <div class="card-h">ARTIFACTS <span class="muted">(auto-extracted)</span></div>
+        <div id="d-artifacts" class="assets muted">none yet</div>
       </div>
       <div class="card">
         <div class="card-h">🚩 FLAGS</div>
@@ -472,6 +480,23 @@ function renderDash(e) {
 
   const a = e.assets || {};
   const row = (k, v) => v && v.length ? `<div><b>${k}:</b> ${escapeHtml(Array.isArray(v) ? v.join(", ") : String(v))}</div>` : "";
+
+  // Hosts / services
+  const ports = a.open_ports || [];
+  $("d-hosts").innerHTML =
+    (a.hosts && a.hosts.length ? `<div><b>hosts:</b> ${escapeHtml(a.hosts.join(", "))}</div>` : "") +
+    (ports.length
+      ? ports.map((p) => `<div>${p.port}/${p.proto || "tcp"} <b>${escapeHtml(p.service || "?")}</b> ${escapeHtml(p.version || "")}</div>`).join("")
+      : "<span class='muted'>no scan yet — run nmap in a pane</span>");
+
+  // Artifacts (hashes / creds / emails)
+  const arts = [];
+  (a.hashes || []).forEach((h) => arts.push(`<div><b>${escapeHtml(h.type)}:</b> ${escapeHtml(h.value)}</div>`));
+  (a.credentials || []).forEach((c) => arts.push(`<div><b>cred:</b> ${escapeHtml(c)}</div>`));
+  (a.emails || []).forEach((m) => arts.push(`<div><b>email:</b> ${escapeHtml(m)}</div>`));
+  $("d-artifacts").innerHTML = arts.length ? arts.join("") : "<span class='muted'>none yet</span>";
+  $("d-artifacts").classList.toggle("muted", !arts.length);
+
   $("d-assets").innerHTML =
     row("hosts", a.hosts) +
     (a.open_ports && a.open_ports.length ? `<div><b>ports:</b> ${a.open_ports.map((p) => p.port + "/" + p.service).join(", ")}</div>` : "") +

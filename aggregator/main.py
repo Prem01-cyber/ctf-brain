@@ -15,8 +15,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 import contextlib
 
-from . import (budget, config, decoders, detect, engagement, llm, methodology,
-               providers, screenshot, tools)
+from . import (budget, config, decoders, detect, engagement, extract, llm,
+               methodology, providers, screenshot, tools)
 from .state import STATE
 
 @contextlib.asynccontextmanager
@@ -89,6 +89,14 @@ async def recv_panes(payload: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(panes, dict):
         return {"ok": False, "error": "expected an object of panes"}
     STATE.set_panes(panes)
+    # Auto-extract from terminal output: parse nmap (→ hosts/ports/services) and
+    # pull artifacts (hashes/creds). Only when the text actually changed.
+    text = "\n".join(p.get("content", "") for p in panes.values())
+    if text and STATE.pane_text_changed(text):
+        STATE.merge_hosts(extract.parse_nmap(text))
+        arts = extract.extract_artifacts(text, "tmux")
+        STATE.add_artifacts(arts)
+        STATE.add_findings(extract.artifacts_to_findings(arts))
     return {"ok": True, "panes": len(panes)}
 
 
@@ -99,6 +107,11 @@ async def recv_browser(payload: dict[str, Any]) -> dict[str, Any]:
     if not STATE.in_scope(payload.get("url", "")):
         return {"ok": True, "skipped": "out-of-scope"}
     STATE.set_browser(payload)
+    # Auto-extract artifacts from the visible page + selection.
+    text = (payload.get("bodyText") or "") + "\n" + (payload.get("selected") or "")
+    arts = extract.extract_artifacts(text, "browser")
+    STATE.add_artifacts(arts)
+    STATE.add_findings(extract.artifacts_to_findings(arts, payload.get("url", "")))
     return {"ok": True}
 
 
@@ -115,6 +128,13 @@ async def recv_flow(payload: dict[str, Any]) -> dict[str, Any]:
     if not STATE.in_scope(payload.get("url", "")):
         return {"ok": True, "skipped": "out-of-scope"}
     findings = detect.scan_flow(payload)
+    # Auto-extract artifacts (hashes/creds/emails) from the bodies + URL.
+    text = (payload.get("resp_body") or "") + "\n" + (payload.get("req_body") or "") \
+        + "\n" + payload.get("url", "")
+    arts = extract.extract_artifacts(text, "http")
+    STATE.add_artifacts(arts)
+    findings += extract.artifacts_to_findings(arts, payload.get("url", ""),
+                                              payload.get("method", ""))
     summary = {
         "method": payload.get("method", "GET"),
         "url": payload.get("url", ""),
@@ -146,6 +166,16 @@ async def get_inventory() -> dict[str, Any]:
 @app.get("/methodology")
 async def get_methodology() -> dict[str, Any]:
     return {"phases": methodology.checklist()}
+
+
+@app.get("/hosts")
+async def get_hosts() -> dict[str, Any]:
+    return {"hosts": STATE.get_hosts()}
+
+
+@app.get("/artifacts")
+async def get_artifacts() -> dict[str, Any]:
+    return {"artifacts": STATE.get_artifacts()}
 
 
 @app.get("/engagement")

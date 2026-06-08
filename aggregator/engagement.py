@@ -34,27 +34,43 @@ def _parse_ports(text: str) -> list[dict[str, str]]:
 def _assets(snapshot: dict[str, Any]) -> dict[str, Any]:
     findings = snapshot.get("findings", [])
     inv = snapshot.get("inventory", {}) or {}
-    ports = _parse_ports(_panes_text(snapshot))
+    artifacts = snapshot.get("artifacts", [])
 
-    hosts = {e.get("host") for e in inv.get("endpoints", []) if e.get("host")}
-    if snapshot.get("browser", {}):
-        bu = (snapshot["browser"] or {}).get("url")
-        if bu:
-            hosts.add(urlsplit(bu).netloc)
+    # Prefer the structured nmap-parsed hosts from the knowledge base; fall back
+    # to a live parse of pane text if the pipeline hasn't populated it yet.
+    kb_hosts = snapshot.get("hosts", [])
+    ports: list[dict[str, str]] = []
+    for h in kb_hosts:
+        ports.extend(h.get("ports", []))
+    if not ports:
+        ports = _parse_ports(_panes_text(snapshot))
 
-    def ev(rule):
-        return [f["evidence"] for f in findings if f.get("rule") == rule]
+    hosts = {h.get("host") for h in kb_hosts if h.get("host") and h["host"] != "unknown"}
+    hosts |= {e.get("host") for e in inv.get("endpoints", []) if e.get("host")}
+    if (snapshot.get("browser") or {}).get("url"):
+        hosts.add(urlsplit(snapshot["browser"]["url"]).netloc)
 
     tech = [f["evidence"] for f in findings if f.get("rule", "").startswith("header_")]
-    tech += [f"{p['service']} {p['version']}".strip() for p in ports if p["version"]]
+    tech += [f"{p.get('service', '')} {p.get('version', '')}".strip()
+             for p in ports if p.get("version")]
+    tech += [h["os"] for h in kb_hosts if h.get("os")]
+
+    def arts(*types):
+        return [a["value"] for a in artifacts if a["type"] in types]
+
+    hashes = [a for a in artifacts if a["type"] not in ("credential", "email")]
     return {
         "hosts": sorted(h for h in hosts if h),
         "open_ports": ports,
+        "services": sorted({p.get("service", "") for p in ports if p.get("service")}),
         "endpoints": len(inv.get("endpoints", [])),
         "params": inv.get("params", []),
         "technologies": sorted(set(tech))[:20],
-        "emails": sorted(set(ev("email")))[:20],
-        "tokens": ev("jwt")[:10],
+        "emails": sorted(set(arts("email") +
+                            [f["evidence"] for f in findings if f.get("rule") == "email"]))[:20],
+        "tokens": [f["evidence"] for f in findings if f.get("rule") == "jwt"][:10],
+        "credentials": arts("credential")[:20],
+        "hashes": [{"type": a["type"], "value": a["value"]} for a in hashes][:30],
         "secrets": [f["title"] + ": " + f["evidence"]
                     for f in findings if f.get("category") == "secret"][:20],
         "flags": sorted(set(snapshot.get("flags", []) +
@@ -106,6 +122,14 @@ def _next_steps(assets: dict[str, Any], findings: list[dict]) -> list[dict[str, 
     if "admin_panel" in rules:
         add(2, "Attack the admin panel", "management endpoint exposed",
             "hydra -L users.txt -P rockyou.txt <host> http-post-form ...", "Exploitation")
+    if assets.get("hashes"):
+        h = assets["hashes"][0]
+        add(0, f"Crack the captured {h['type']} hash", "password hash recovered",
+            "hashcat -a 0 hash.txt /usr/share/wordlists/rockyou.txt  # (pick -m by type)",
+            "Exploitation")
+    if assets.get("credentials"):
+        add(1, "Try the captured credentials", "credential discovered in traffic/output",
+            f"# spray {assets['credentials'][0]} against ssh/web/db on {host}", "Exploitation")
     pw = {p.lower() for p in assets["params"]}
     if {"password", "passwd", "pass"} & pw and {"user", "username", "email"} & pw:
         add(1, "Test the login (SQLi bypass / cred spray)",

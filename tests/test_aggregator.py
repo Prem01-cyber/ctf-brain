@@ -39,6 +39,10 @@ def reset_state():
     STATE.notes = []
     STATE.tasks = []
     STATE.flags = []
+    STATE.hosts = {}
+    STATE.artifacts = []
+    STATE._artifact_keys = set()
+    STATE._last_pane_hash = None
     STATE.session = "default"
     STATE._counter = 0
     STATE._dirty = False
@@ -523,6 +527,72 @@ def test_sessions_isolated_and_persisted(client, monkeypatch, tmp_path):
     notes = [n["text"] for n in client.get("/engagement").json()["notes"]]
     assert notes == ["alpha note"]
     assert "beta" in client.get("/sessions").json()["sessions"]
+
+
+# --- extraction pipeline (auto knowledge base) -----------------------------
+NMAP = """Nmap scan report for target.htb (10.10.10.5)
+Host is up (0.012s latency).
+PORT     STATE SERVICE VERSION
+22/tcp   open  ssh     OpenSSH 8.2p1 Ubuntu
+80/tcp   open  http    nginx 1.18.0
+3306/tcp open  mysql   MySQL 5.7
+Service Info: OS: Linux; CPE: cpe:/o:linux:linux_kernel
+"""
+
+
+def test_parse_nmap_structured():
+    from aggregator import extract
+    hosts = extract.parse_nmap(NMAP)
+    assert len(hosts) == 1
+    h = hosts[0]
+    assert h["host"] == "10.10.10.5" and h["hostname"] == "target.htb"
+    assert "Linux" in h["os"]
+    ports = h["ports"]
+    assert ports["80/tcp"]["service"] == "http" and ports["80/tcp"]["version"] == "nginx 1.18.0"
+    assert set(p.split("/")[0] for p in ports) == {"22", "80", "3306"}
+
+
+def test_extract_artifacts_hashes_and_creds():
+    from aggregator import extract
+    text = ("user:$2a$12$" + "a" * 53 + "\n"
+            "md5 5f4dcc3b5aa765d61d8327deb882cf99\n"
+            "username = admin\npassword: hunter2\n"
+            "contact bob@target.htb")
+    arts = {a["type"]: a for a in extract.extract_artifacts(text, "tmux")}
+    assert "bcrypt" in arts and arts["bcrypt"]["confidence"] == "high"
+    assert "md5/ntlm" in arts
+    assert any(a["type"] == "credential" for a in extract.extract_artifacts(text, "tmux"))
+    assert "email" in arts
+
+
+def test_panes_pipeline_builds_host_kb(client):
+    client.post("/panes", json={"panes": {"a:0:0": _pane("a", "0", "0", "bash", NMAP, active=True)}})
+    hosts = client.get("/hosts").json()["hosts"]
+    assert hosts and hosts[0]["host"] == "10.10.10.5"
+    svcs = {p["service"] for p in hosts[0]["ports"]}
+    assert {"ssh", "http", "mysql"} <= svcs
+    e = client.get("/engagement").json()
+    assert "mysql" in e["assets"]["services"]
+    # mysql is a non-web service → an "enumerate" next-step should appear
+    assert any("mysql" in s["title"].lower() for s in e["next_steps"])
+
+
+def test_flow_pipeline_extracts_and_alerts_hash(client):
+    bcrypt = "$2b$10$" + "b" * 53
+    r = client.post("/flow", json={"method": "GET", "url": "http://t/dump",
+                                   "resp_body": f"row: admin {bcrypt}"}).json()
+    assert r["new"] >= 1  # surfaced as a finding too
+    arts = client.get("/artifacts").json()["artifacts"]
+    assert any(a["type"] == "bcrypt" and a["value"] == bcrypt for a in arts)
+    assert any(f["rule"] == "artifact_bcrypt" for f in client.get("/findings").json()["findings"])
+
+
+def test_artifacts_dedupe_across_calls(client):
+    md5 = "d41d8cd98f00b204e9800998ecf8427e"
+    client.post("/flow", json={"url": "http://t/a", "method": "GET", "resp_body": md5})
+    client.post("/flow", json={"url": "http://t/b", "method": "GET", "resp_body": md5})
+    vals = [a["value"] for a in client.get("/artifacts").json()["artifacts"]]
+    assert vals.count(md5) == 1
 
 
 def test_tool_get_engagement_and_add_note():

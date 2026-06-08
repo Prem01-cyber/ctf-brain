@@ -47,7 +47,8 @@ Without an API key the collectors and UI still run — only chat is disabled.
 | **detect** | Detection engine: scans flows, auto-flags findings (incl. JWT decode). | (library; see Web enumeration) |
 | **decoders / tools** | JWT + magic decoders; agent tool layer (findings/inventory/decode/replay/run). | (library; see Assistant tools) |
 | **inventory / methodology** | Recon site-map + param mining; phase playbook. | `GET /inventory`, `GET /methodology` |
-| **engagement / sessions** | Dynamic phase + next-steps; per-session notes/tasks/flags, persisted. | `GET /engagement`, `GET /sessions` |
+| **extract** | Auto-extraction: parse nmap → hosts/ports; pull hashes/creds/emails from any text. | (pipeline; see Cockpit) |
+| **engagement / sessions** | Dynamic phase + next-steps; per-session hosts/artifacts/notes/tasks/flags, persisted. | `GET /engagement`, `/hosts`, `/artifacts`, `/sessions` |
 | **proxy addon** | mitmproxy addon: Burp-level full-traffic feed. | `mitmdump -s proxy/ctf_addon.py -p 8080` |
 | **extension** | MV3 browser extension: page snapshots + request/response **body** capture. | Load unpacked from `extension/` |
 | **ui** | Single-file chat UI with live status pills and streaming replies. | served at `http://127.0.0.1:7331/` |
@@ -144,6 +145,24 @@ enumeration → exploitation → post-exploitation) and names the current phase.
 
 ## Cockpit: dynamic engagement tracking (the dashboard)
 
+### Automatic extraction pipeline
+
+Everything you do is mined into an accumulating, persisted **knowledge base**
+([extract.py](aggregator/extract.py)) — no manual entry:
+
+- **nmap in a tmux pane** → parsed into structured **hosts → ports → service →
+  version → OS** the moment the output appears (deduped, accumulates across scans).
+- **Opening a page / any HTTP body / terminal text** → scanned for **artifacts
+  that shouldn't be lying around**: password hashes (bcrypt/sha-crypt/argon2 +
+  bare MD5/SHA1/SHA256/SHA512/NTLM), credentials (`user=`/`password:`…), and
+  emails — auto-extracted, deduped, surfaced as both **artifacts** (knowledge
+  base) and **findings** (alerts).
+
+Those feed the dashboard and the next-steps engine (e.g. a captured bcrypt →
+"Crack the captured bcrypt hash"; an open mysql port → "Enumerate mysql").
+
+### The dashboard
+
 The right-hand **dashboard** turns the chat into a pentest cockpit. It's driven by
 a dynamic engagement model ([engagement.py](aggregator/engagement.py)) — *not* a
 fixed checklist — recomputed from live state:
@@ -154,9 +173,10 @@ fixed checklist — recomputed from live state:
   (dump an exposed `.git`, `sqlmap` a parameter that threw a SQL error, brute a
   discovered login, `ffuf` mined params, enumerate an open service…). Click one to
   load it into the chat.
-- **Assets** — hosts, open ports/services (parsed from your nmap pane), endpoints,
-  parameters, tech/versions, tokens, emails, secrets — harvested from findings,
-  inventory, and terminals.
+- **Hosts / services** — structured nmap results (port → service → version → OS).
+- **Artifacts** — auto-extracted hashes, credentials, and emails.
+- **Assets** — endpoints, parameters, tech/versions, tokens, secrets — harvested
+  from findings, inventory, and terminals.
 - **🚩 Flags**, **Tasks** (add/check off), **Notes** (add) — your tracked state.
 
 **Sessions / persistence.** Each engagement is a named session, isolated and saved
