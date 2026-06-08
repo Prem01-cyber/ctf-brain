@@ -6,9 +6,18 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from aggregator import budget, config, detect, llm, providers, screenshot
+import base64
+import json
+
+from aggregator import budget, config, decoders, detect, llm, providers, screenshot, tools
 from aggregator.main import app
 from aggregator.state import STATE
+
+
+def _jwt(header, payload):
+    h = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
+    p = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+    return f"{h}.{p}."
 
 
 @pytest.fixture(autouse=True)
@@ -23,6 +32,10 @@ def reset_state():
     STATE.findings = []
     STATE._finding_keys = set()
     STATE.scope = []
+    STATE.endpoints = {}
+    STATE.params = set()
+    STATE.links = set()
+    STATE.flows_full.clear()
     STATE.last_pane_update = None
     yield
 
@@ -131,7 +144,7 @@ def test_chat_streams_with_context(client, monkeypatch):
 
     captured = {}
 
-    async def fake_stream(messages, rendered_context, image_b64=None):
+    async def fake_stream(messages, rendered_context, image_b64=None, **kw):
         captured["context"] = rendered_context
         captured["image"] = image_b64
         yield "do "
@@ -148,7 +161,7 @@ def test_chat_streams_with_context(client, monkeypatch):
 def test_chat_attaches_screenshot(client, monkeypatch):
     monkeypatch.setattr(screenshot, "capture_b64", lambda: "QUJD")
 
-    async def fake_stream(messages, rendered_context, image_b64=None):
+    async def fake_stream(messages, rendered_context, image_b64=None, **kw):
         assert image_b64 == "QUJD"
         yield "ok"
 
@@ -347,3 +360,119 @@ def test_scope_filters_browser_snapshot(client):
 
 def test_empty_scope_allows_everything(client):
     assert STATE.in_scope("http://anything/") is True
+
+
+# --- decoders --------------------------------------------------------------
+def test_magic_decodes_nested_base64_flag():
+    inner = base64.b64encode(b"flag{magic}").decode()
+    outer = base64.b64encode(inner.encode()).decode()
+    res = decoders.magic(outer)
+    assert any(r["flag"] for r in res)
+
+
+def test_decode_jwt_flags_alg_none():
+    d = decoders.decode_jwt(_jwt({"alg": "none"}, {"role": "admin"}))
+    assert any("alg=none" in i for i in d["issues"])
+    assert d["payload"]["role"] == "admin"
+
+
+def test_scan_flags_jwt_alg_none_high():
+    fs = detect.scan_flow({"url": "http://t/", "resp_body": "t=" + _jwt({"alg": "none"}, {"u": 1})})
+    assert any(f["rule"] == "jwt" and f["severity"] == "high" for f in fs)
+
+
+def test_decode_endpoint(client):
+    inner = base64.b64encode(b"flag{endpoint}").decode()
+    outer = base64.b64encode(inner.encode()).decode()
+    r = client.post("/decode", json={"text": outer}).json()
+    assert any(m["flag"] for m in r["magic"])
+
+
+# --- inventory -------------------------------------------------------------
+def test_inventory_mines_params_and_endpoints(client):
+    client.post("/flow", json={"method": "POST", "url": "http://t/login?next=/x",
+                               "req_body": '{"username":"a","password":"b"}', "status": 200,
+                               "resp_body": '<a href="/admin">a</a>'})
+    inv = client.get("/inventory").json()
+    assert "username" in inv["params"] and "next" in inv["params"]
+    assert any(e["path"] == "/login" for e in inv["endpoints"])
+    assert "/admin" in inv["links"]
+    assert "username" in client.get("/context").json()["rendered"]
+
+
+def test_methodology_endpoint(client):
+    phases = client.get("/methodology").json()["phases"]
+    assert [p["phase"] for p in phases][:2] == ["Recon", "Scanning"]
+
+
+def test_methodology_in_system_prompt():
+    assert "METHODOLOGY" in llm.build_system_prompt("ctx")
+
+
+# --- replay (Repeater) -----------------------------------------------------
+def test_replay_resends_and_scans(client, monkeypatch):
+    import datetime
+    from aggregator import tools as tools_mod
+
+    class FakeResp:
+        status_code = 200
+        text = "leak flag{replayed}"
+        headers = {"content-type": "text/html", "Server": "nginx"}
+        elapsed = datetime.timedelta(milliseconds=12)
+
+    class FakeClient:
+        def __init__(self, **kw): ...
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def request(self, *a, **k): return FakeResp()
+
+    monkeypatch.setattr(tools_mod.httpx, "AsyncClient", FakeClient)
+    r = client.post("/replay", json={"method": "GET", "url": "http://t/x"}).json()
+    assert r["ok"] and r["status"] == 200
+    assert "flag{replayed}" in r["body"]
+    assert r["findings"] >= 1
+
+
+def test_replay_requires_url(client):
+    assert client.post("/replay", json={"method": "GET"}).json()["ok"] is False
+
+
+# --- agent tools -----------------------------------------------------------
+def _run(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
+def test_tool_list_findings(client):
+    client.post("/flow", json={"url": "http://t/.git/config", "method": "GET"})
+    out = _run(tools.run_tool("list_findings", {}))
+    assert "exposed_vcs" in out
+
+
+def test_tool_decode_and_inventory():
+    inner = base64.b64encode(b"flag{tool}").decode()
+    outer = base64.b64encode(inner.encode()).decode()
+    assert "flag{tool}" in _run(tools.run_tool("decode", {"text": outer}))
+    assert "endpoints" in _run(tools.run_tool("get_inventory", {}))
+
+
+def test_tool_run_command_gated():
+    out = _run(tools.run_tool("run_command", {"command": "id"}, allow_exec=False))
+    assert "disabled" in out
+
+
+def test_chat_agent_mode_routes_to_stream_agent(client, monkeypatch):
+    seen = {}
+
+    async def fake_agent(self, messages, system, image_b64=None, allow_exec=False):
+        seen["allow_exec"] = allow_exec
+        yield "agent-reply"
+
+    monkeypatch.setattr(providers.OpenAIProvider, "stream_agent", fake_agent)
+    monkeypatch.setattr(providers.AnthropicProvider, "stream_agent", fake_agent)
+    monkeypatch.setattr(providers.OpenAIProvider, "available", lambda self: True)
+    monkeypatch.setattr(providers.AnthropicProvider, "available", lambda self: True)
+    r = client.post("/chat", json={"messages": [{"role": "user", "content": "go"}],
+                                   "agent": True, "allow_exec": True})
+    assert r.text == "agent-reply"
+    assert seen["allow_exec"] is True

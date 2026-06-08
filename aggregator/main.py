@@ -13,7 +13,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import budget, config, detect, llm, providers, screenshot
+from . import (budget, config, decoders, detect, llm, methodology,
+               providers, screenshot, tools)
 from .state import STATE
 
 app = FastAPI(title="ctf-brain aggregator", version="0.1.0")
@@ -105,6 +106,7 @@ async def recv_flow(payload: dict[str, Any]) -> dict[str, Any]:
     STATE.add_xhr({
         "method": summary["method"], "url": summary["url"], "status": summary["status"],
     })
+    STATE.update_inventory(payload)
     added = STATE.add_flow(summary, findings)
     return {"ok": True, "findings": len(findings), "new": added}
 
@@ -113,6 +115,49 @@ async def recv_flow(payload: dict[str, Any]) -> dict[str, Any]:
 async def get_findings() -> dict[str, Any]:
     findings = sorted(STATE.get_findings(), key=lambda f: detect.severity_rank(f["severity"]))
     return {"count": len(findings), "findings": findings}
+
+
+@app.get("/inventory")
+async def get_inventory() -> dict[str, Any]:
+    return STATE.get_inventory()
+
+
+@app.get("/methodology")
+async def get_methodology() -> dict[str, Any]:
+    return {"phases": methodology.checklist()}
+
+
+@app.post("/decode")
+async def decode(payload: dict[str, Any]) -> dict[str, Any]:
+    text = str(payload.get("text", ""))
+    jwt_part = text.strip().split()[0] if text.strip() else ""
+    return {
+        "jwt": decoders.decode_jwt(jwt_part) if jwt_part.startswith("eyJ") else None,
+        "magic": decoders.magic(text),
+    }
+
+
+@app.post("/replay")
+async def replay(payload: dict[str, Any]) -> dict[str, Any]:
+    """Repeater: resend a (possibly modified) request server-side and return the
+    response (also scanned for findings). The browser can't do this cross-origin."""
+    if not payload.get("url"):
+        return {"ok": False, "error": "url required"}
+    try:
+        res = await tools.replay_request(
+            payload.get("method", "GET"), payload["url"],
+            payload.get("headers"), payload.get("body"))
+        return {"ok": True, "status": res["status"], "headers": res["headers"],
+                "body": res["body"][:200_000], "elapsed_ms": res["elapsed_ms"],
+                "findings": len(res["findings"])}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/flows")
+async def get_flows() -> dict[str, Any]:
+    """Recent full flows (for seeding the Repeater)."""
+    return {"flows": STATE.get_flows_full()}
 
 
 @app.get("/scope")
@@ -154,6 +199,8 @@ async def get_context() -> dict[str, Any]:
 async def chat(payload: dict[str, Any], request: Request) -> Any:
     messages = payload.get("messages", [])
     want_shot = bool(payload.get("screenshot"))
+    agent = bool(payload.get("agent"))
+    allow_exec = bool(payload.get("allow_exec"))
 
     ctx = budget.build_context(STATE.snapshot())
 
@@ -165,7 +212,8 @@ async def chat(payload: dict[str, Any], request: Request) -> Any:
         image_b64 = STATE.consume_screenshot()
 
     async def gen():
-        async for chunk in llm.stream_reply(messages, ctx["rendered"], image_b64):
+        async for chunk in llm.stream_reply(messages, ctx["rendered"], image_b64,
+                                            agent=agent, allow_exec=allow_exec):
             if await request.is_disconnected():
                 break
             yield chunk

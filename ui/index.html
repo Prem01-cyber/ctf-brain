@@ -82,15 +82,20 @@
   <footer>
     <div class="composer">
       <button class="toggle" id="shotBtn" title="Attach a screenshot to the next message">📷</button>
+      <button class="toggle" id="agentBtn" title="Agent mode: the model can query findings, decode, send requests, run commands">🤖 agent</button>
+      <button class="toggle" id="execBtn" title="Allow the agent to run commands in your active tmux pane">▶ run</button>
       <textarea id="input" placeholder="What should I try next?" rows="1"></textarea>
       <button class="send" id="sendBtn">Send</button>
     </div>
     <div class="composer-row">
-      <a id="ctxBtn">peek at injected context</a>
-      <span>·</span>
+      <a id="nextBtn">⏭ next steps</a><span>·</span>
+      <a id="decodeBtn">decode</a><span>·</span>
+      <a id="repeaterBtn">repeater</a><span>·</span>
+      <a id="invBtn">inventory</a><span>·</span>
+      <a id="ctxBtn">context</a><span>·</span>
       <label>scope: <input id="scope" placeholder="host filter (blank = all)"
         style="background:var(--bg);color:var(--fg);border:1px solid var(--border);
-        border-radius:5px;padding:2px 6px;font:12px var(--mono);width:220px"></label>
+        border-radius:5px;padding:2px 6px;font:12px var(--mono);width:180px"></label>
       <span id="busy"></span>
     </div>
   </footer>
@@ -102,6 +107,45 @@
     <div id="findList"></div>
     <div style="margin-top:10px;text-align:right">
       <button onclick="document.getElementById('findDialog').close()">close</button></div>
+  </dialog>
+
+  <dialog id="decodeDialog" style="min-width:60vw">
+    <h3 style="margin:0 0 8px">Decode (JWT + magic)</h3>
+    <textarea id="decIn" rows="3" placeholder="paste a token / encoded blob"
+      style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:8px;font:12px var(--mono)"></textarea>
+    <div style="margin:8px 0"><button id="decGo" class="send">Decode</button></div>
+    <pre id="decOut" style="white-space:pre-wrap;font:12px var(--mono);max-height:50vh;overflow:auto"></pre>
+    <div style="text-align:right"><button onclick="document.getElementById('decodeDialog').close()">close</button></div>
+  </dialog>
+
+  <dialog id="repeaterDialog" style="min-width:72vw">
+    <h3 style="margin:0 0 8px">Repeater</h3>
+    <div style="display:flex;gap:6px;margin-bottom:6px">
+      <select id="repMethod" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px">
+        <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option><option>HEAD</option><option>OPTIONS</option></select>
+      <input id="repUrl" placeholder="http://target/path" style="flex:1;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px;font:12px var(--mono)">
+      <select id="repFlows" title="load a captured request" style="background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px;max-width:240px"></select>
+      <button id="repGo" class="send">Send</button>
+    </div>
+    <div style="display:flex;gap:8px">
+      <div style="flex:1">
+        <div style="font:11px var(--mono);color:var(--muted)">request headers (one per line: Name: value)</div>
+        <textarea id="repHeaders" rows="4" style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px;font:12px var(--mono)"></textarea>
+        <div style="font:11px var(--mono);color:var(--muted)">body</div>
+        <textarea id="repBody" rows="6" style="width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px;font:12px var(--mono)"></textarea>
+      </div>
+      <div style="flex:1">
+        <div style="font:11px var(--mono);color:var(--muted)" id="repStatus">response</div>
+        <pre id="repOut" style="white-space:pre-wrap;font:12px var(--mono);height:340px;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:8px"></pre>
+      </div>
+    </div>
+    <div style="text-align:right;margin-top:8px"><button onclick="document.getElementById('repeaterDialog').close()">close</button></div>
+  </dialog>
+
+  <dialog id="invDialog" style="min-width:60vw">
+    <h3 style="margin:0 0 8px">Recon inventory</h3>
+    <pre id="invOut" style="white-space:pre-wrap;font:12px var(--mono);max-height:60vh;overflow:auto"></pre>
+    <div style="text-align:right"><button onclick="document.getElementById('invDialog').close()">close</button></div>
   </dialog>
   <style>
     .find { border-left: 3px solid var(--border); padding: 6px 10px; margin: 6px 0;
@@ -124,6 +168,8 @@ const API = location.origin.startsWith("http") ? "" : "http://127.0.0.1:7331";
 const $ = (id) => document.getElementById(id);
 const history = [];
 let attachShot = false;
+let agentOn = false;
+let execOn = false;
 let busy = false;
 
 // --- tiny, safe markdown-ish renderer (escape first, then code blocks) ---
@@ -173,7 +219,8 @@ async function send() {
     const res = await fetch(API + "/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: history, screenshot: shot }),
+      body: JSON.stringify({ messages: history, screenshot: shot,
+        agent: agentOn, allow_exec: execOn }),
     });
     const reader = res.body.getReader();
     const dec = new TextDecoder();
@@ -232,6 +279,80 @@ async function poll() {
 // --- wiring ---
 $("sendBtn").onclick = send;
 $("shotBtn").onclick = () => setShot(!attachShot);
+$("agentBtn").onclick = () => { agentOn = !agentOn; $("agentBtn").classList.toggle("on", agentOn); };
+$("execBtn").onclick = () => {
+  execOn = !execOn;
+  if (execOn && !agentOn) { agentOn = true; $("agentBtn").classList.add("on"); }
+  $("execBtn").classList.toggle("on", execOn);
+};
+$("nextBtn").onclick = () => {
+  $("input").value = "Based on the live context, what phase am I in and what are the "
+    + "2-3 highest-value next steps? Give exact commands.";
+  send();
+};
+
+// Decode dialog
+$("decodeBtn").onclick = () => { $("decOut").textContent = ""; $("decodeDialog").showModal(); $("decIn").focus(); };
+$("decGo").onclick = async () => {
+  const r = await fetch(API + "/decode", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text: $("decIn").value }),
+  }).then((r) => r.json());
+  let out = "";
+  if (r.jwt) out += "JWT\n  header: " + JSON.stringify(r.jwt.header)
+    + "\n  payload: " + JSON.stringify(r.jwt.payload)
+    + "\n  issues:\n    - " + (r.jwt.issues.join("\n    - ") || "none") + "\n\n";
+  out += "magic:\n" + (r.magic.length
+    ? r.magic.map((m) => `  [${m.recipe}]${m.flag ? " 🚩" : ""}\n    ${m.output}`).join("\n")
+    : "  (no decodings)");
+  $("decOut").textContent = out;
+};
+
+// Repeater dialog
+$("repeaterBtn").onclick = async () => {
+  const { flows } = await fetch(API + "/flows").then((r) => r.json());
+  const sel = $("repFlows");
+  sel.innerHTML = "<option value=''>— load captured request —</option>"
+    + flows.slice().reverse().map((f, i) =>
+        `<option value="${flows.length - 1 - i}">${f.method} ${f.url.slice(0, 60)}</option>`).join("");
+  sel._flows = flows;
+  $("repeaterDialog").showModal();
+};
+$("repFlows").onchange = (e) => {
+  const f = $("repFlows")._flows[+e.target.value];
+  if (!f) return;
+  $("repMethod").value = f.method || "GET";
+  $("repUrl").value = f.url || "";
+  $("repHeaders").value = Object.entries(f.req_headers || {}).map(([k, v]) => `${k}: ${v}`).join("\n");
+  $("repBody").value = f.req_body || "";
+};
+$("repGo").onclick = async () => {
+  const headers = {};
+  $("repHeaders").value.split("\n").forEach((l) => {
+    const i = l.indexOf(":"); if (i > 0) headers[l.slice(0, i).trim()] = l.slice(i + 1).trim();
+  });
+  $("repStatus").textContent = "sending…";
+  const r = await fetch(API + "/replay", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ method: $("repMethod").value, url: $("repUrl").value,
+      headers, body: $("repBody").value || null }),
+  }).then((r) => r.json());
+  if (!r.ok) { $("repStatus").textContent = "error"; $("repOut").textContent = r.error; return; }
+  $("repStatus").textContent = `${r.status} · ${r.elapsed_ms}ms · ${r.findings} finding(s)`;
+  const hdrs = Object.entries(r.headers).map(([k, v]) => `${k}: ${v}`).join("\n");
+  $("repOut").textContent = hdrs + "\n\n" + r.body;
+};
+
+// Inventory dialog
+$("invBtn").onclick = async () => {
+  const inv = await fetch(API + "/inventory").then((r) => r.json());
+  let out = "PARAMS (injection candidates):\n  " + (inv.params.join(", ") || "—") + "\n\nENDPOINTS:\n";
+  out += inv.endpoints.map((e) => `  ${e.methods.join("/") || "?"} ${e.host}${e.path}`
+    + (e.params.length ? "  ?" + e.params.join(",") : "")).join("\n") || "  —";
+  out += "\n\nDISCOVERED (not yet visited):\n  " + (inv.links.join("\n  ") || "—");
+  $("invOut").textContent = out;
+  $("invDialog").showModal();
+};
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });

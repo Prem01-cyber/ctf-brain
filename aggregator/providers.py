@@ -12,10 +12,26 @@ Together, Ollama, local vLLM — giving broad "all LLMs" coverage with one backe
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, AsyncIterator
 
-from . import config
+from . import config, tools
+
+_MAX_AGENT_ITERS = 8
+
+
+def _anthropic_tools() -> list[dict[str, Any]]:
+    return [{"name": t["name"], "description": t["description"],
+             "input_schema": {"type": "object", "properties": t["properties"],
+                              "required": t["required"]}} for t in tools.TOOLS]
+
+
+def _openai_tools() -> list[dict[str, Any]]:
+    return [{"type": "function", "function": {
+        "name": t["name"], "description": t["description"],
+        "parameters": {"type": "object", "properties": t["properties"],
+                       "required": t["required"]}}} for t in tools.TOOLS]
 
 
 # --- image attachment helpers (format differs per provider) ----------------
@@ -74,6 +90,16 @@ class Provider:
         raise NotImplementedError
         yield ""  # make this an async generator for type-checkers
 
+    async def stream_agent(
+        self,
+        messages: list[dict[str, Any]],
+        system: str,
+        image_b64: str | None = None,
+        allow_exec: bool = False,
+    ) -> AsyncIterator[str]:  # pragma: no cover - interface
+        raise NotImplementedError
+        yield ""
+
 
 class AnthropicProvider(Provider):
     name = "anthropic"
@@ -102,6 +128,49 @@ class AnthropicProvider(Provider):
             yield f"\n[ctf-brain] anthropic API error {e.status_code}: {e.message}"
         except Exception as e:  # noqa: BLE001
             yield f"\n[ctf-brain] anthropic error: {e}"
+
+    async def stream_agent(self, messages, system, image_b64=None, allow_exec=False):
+        import anthropic
+
+        msgs = [dict(m) for m in messages]
+        if image_b64:
+            msgs = attach_image_anthropic(msgs, image_b64)
+        atools = _anthropic_tools()
+        try:
+            client = anthropic.AsyncAnthropic()
+            for _ in range(_MAX_AGENT_ITERS):
+                # Thinking disabled in agent mode to avoid thinking-block re-submission.
+                resp = await client.messages.create(
+                    model=config.MODEL, max_tokens=config.MAX_OUTPUT_TOKENS,
+                    system=system, messages=msgs, tools=atools,
+                    thinking={"type": "disabled"},
+                )
+                assistant: list[dict[str, Any]] = []
+                tool_uses = []
+                for b in resp.content:
+                    if b.type == "text":
+                        if b.text:
+                            yield b.text
+                        assistant.append({"type": "text", "text": b.text})
+                    elif b.type == "tool_use":
+                        assistant.append({"type": "tool_use", "id": b.id,
+                                          "name": b.name, "input": b.input})
+                        tool_uses.append(b)
+                if resp.stop_reason != "tool_use" or not tool_uses:
+                    return
+                msgs.append({"role": "assistant", "content": assistant})
+                results = []
+                for tu in tool_uses:
+                    yield f"\n🔧 {tu.name}({json.dumps(tu.input)[:120]})\n"
+                    out = await tools.run_tool(tu.name, tu.input, allow_exec)
+                    results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                    "content": out})
+                msgs.append({"role": "user", "content": results})
+            yield "\n[ctf-brain] agent reached max iterations."
+        except anthropic.APIStatusError as e:
+            yield f"\n[ctf-brain] anthropic API error {e.status_code}: {e.message}"
+        except Exception as e:  # noqa: BLE001
+            yield f"\n[ctf-brain] anthropic agent error: {e}"
 
 
 class OpenAIProvider(Provider):
@@ -147,6 +216,54 @@ class OpenAIProvider(Provider):
             yield f"\n[ctf-brain] openai API error {e.status_code}: {e.message}"
         except Exception as e:  # noqa: BLE001
             yield f"\n[ctf-brain] openai error: {e}"
+
+    async def _create(self, client, **kw):
+        import openai
+
+        try:
+            return await client.chat.completions.create(
+                max_tokens=config.MAX_OUTPUT_TOKENS, **kw)
+        except openai.BadRequestError as e:
+            if "max_tokens" in str(e) or "max_completion_tokens" in str(e):
+                return await client.chat.completions.create(
+                    max_completion_tokens=config.MAX_OUTPUT_TOKENS, **kw)
+            raise
+
+    async def stream_agent(self, messages, system, image_b64=None, allow_exec=False):
+        import openai
+        from openai import AsyncOpenAI
+
+        msgs = self._messages(messages, system, image_b64)
+        otools = _openai_tools()
+        try:
+            client = AsyncOpenAI(base_url=config.OPENAI_BASE_URL)
+            for _ in range(_MAX_AGENT_ITERS):
+                resp = await self._create(client, model=config.MODEL, messages=msgs,
+                                          tools=otools)
+                msg = resp.choices[0].message
+                if msg.content:
+                    yield msg.content
+                if not msg.tool_calls:
+                    return
+                msgs.append({
+                    "role": "assistant", "content": msg.content or "",
+                    "tool_calls": [{"id": tc.id, "type": "function",
+                                    "function": {"name": tc.function.name,
+                                                 "arguments": tc.function.arguments}}
+                                   for tc in msg.tool_calls]})
+                for tc in msg.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+                    yield f"\n🔧 {tc.function.name}({json.dumps(args)[:120]})\n"
+                    out = await tools.run_tool(tc.function.name, args, allow_exec)
+                    msgs.append({"role": "tool", "tool_call_id": tc.id, "content": out})
+            yield "\n[ctf-brain] agent reached max iterations."
+        except openai.APIStatusError as e:
+            yield f"\n[ctf-brain] openai API error {e.status_code}: {e.message}"
+        except Exception as e:  # noqa: BLE001
+            yield f"\n[ctf-brain] openai agent error: {e}"
 
 
 _REGISTRY: dict[str, Provider] = {

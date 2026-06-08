@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, AsyncIterator
 
-from . import config, providers
+from . import config, methodology, providers
 
 # Backwards-compatible alias: tests and older call sites use llm._attach_image
 # (Anthropic image-block format).
@@ -31,6 +31,8 @@ grounded in what you can actually see over generic advice. If the context \
 doesn't contain what you'd need, say so and ask for it (e.g. "run X and show me \
 the output"). This is an authorized security-testing context.
 
+{methodology}
+
 ===== LIVE WORKSTATION CONTEXT (auto-captured, newest data prioritized) =====
 {context}
 ===== END LIVE CONTEXT =====
@@ -38,7 +40,8 @@ the output"). This is an authorized security-testing context.
 
 
 def build_system_prompt(rendered_context: str) -> str:
-    return _SYSTEM_PREAMBLE.format(context=rendered_context)
+    return _SYSTEM_PREAMBLE.format(
+        methodology=methodology.system_block(), context=rendered_context)
 
 
 def has_api_key() -> bool:
@@ -50,6 +53,8 @@ async def stream_reply(
     messages: list[dict[str, Any]],
     rendered_context: str,
     image_b64: str | None = None,
+    agent: bool = False,
+    allow_exec: bool = False,
 ) -> AsyncIterator[str]:
     """Yield text deltas of the model's reply.
 
@@ -59,8 +64,9 @@ async def stream_reply(
     provider = providers.get_provider()
     if not provider.available():
         # Fall back to any provider that does have a key.
-        if has_api_key():
-            provider = next(p for p in providers._REGISTRY.values() if p.available())
+        fallback = next((p for p in providers._REGISTRY.values() if p.available()), None)
+        if fallback is not None:
+            provider = fallback
         else:
             yield (f"[ctf-brain] No API key for provider '{config.PROVIDER}'. Set "
                    "ANTHROPIC_API_KEY or OPENAI_API_KEY (and optionally CTF_PROVIDER) "
@@ -72,5 +78,9 @@ async def stream_reply(
         return
 
     system = build_system_prompt(rendered_context)
-    async for chunk in provider.stream(messages, system, image_b64):
-        yield chunk
+    if agent:
+        async for chunk in provider.stream_agent(messages, system, image_b64, allow_exec):
+            yield chunk
+    else:
+        async for chunk in provider.stream(messages, system, image_b64):
+            yield chunk

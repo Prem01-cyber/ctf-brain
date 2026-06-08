@@ -90,6 +90,25 @@ def build_context(state: dict[str, Any], budget_tokens: int | None = None) -> di
         if add("\n".join(lines)):
             sections["findings"] = shown
 
+    # --- Priority ~1.7: recon inventory (endpoints + injection candidates) ---
+    inv = state.get("inventory") or {}
+    params = inv.get("params") or []
+    endpoints = inv.get("endpoints") or []
+    if params or endpoints:
+        lines = ["### recon inventory"]
+        if params:
+            lines.append("params seen (injection candidates): " + ", ".join(params[:60]))
+        if endpoints:
+            lines.append("endpoints:")
+            for e in endpoints[:40]:
+                m = "/".join(e.get("methods", [])) or "?"
+                ps = ("?" + ",".join(e["params"])) if e.get("params") else ""
+                lines.append(f"  {m} {e.get('host', '')}{e.get('path', '')}{ps}")
+        links = inv.get("links") or []
+        if links:
+            lines.append("discovered (not yet visited): " + ", ".join(links[:30]))
+        add("\n".join(lines))
+
     # --- Priority 2: browser (selection > url/title > visible body) ----------
     browser = state.get("browser")
     if browser and _fresh(browser.get("timestamp_recv"), now):

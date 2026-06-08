@@ -18,6 +18,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from . import decoders
+
+# Signature segment may be empty (alg=none tokens) — keep it optional.
+_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*")
+
 # Cap how much body we regex-scan, to keep latency bounded on huge responses.
 MAX_SCAN_CHARS = 200_000
 _EVIDENCE_PAD = 60  # chars of context around a regex match
@@ -37,8 +42,7 @@ _RULES: list[tuple[str, str, str, str, re.Pattern[str]]] = [
      re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}")),
     ("github_token", "GitHub token", "high", "secret",
      re.compile(r"\bgh[pousr]_[0-9A-Za-z]{36,}\b")),
-    ("jwt", "JWT", "medium", "secret",
-     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}")),
+    # JWTs handled separately (see _scan_jwt) so we can decode + flag weaknesses.
     # Require a real :/= separator so prose like "password preferences" doesn't hit.
     ("secret_assignment", "Secret-looking assignment", "medium", "secret",
      re.compile(r"(?i)(?:api[_-]?key|secret|passwd|password|access[_-]?token|"
@@ -95,6 +99,22 @@ _FLAG_LABEL_BLOCK = frozenset({
     "typeof", "delete", "yield", "await", "with", "function", "if", "for", "while",
     "switch", "catch", "var", "let", "const", "class", "enum", "struct", "default",
 })
+
+
+def _scan_jwt(text: str, where: str, flow: dict[str, Any], out: list[dict[str, Any]]) -> None:
+    if not text:
+        return
+    for m in _JWT_RE.finditer(text[:MAX_SCAN_CHARS]):
+        token = m.group(0)
+        decoded = decoders.decode_jwt(token)
+        if not decoded:
+            continue
+        sev = "high" if any("alg=none" in i for i in decoded["issues"]) else "medium"
+        ev = f"alg={decoded['header'].get('alg')} payload={decoded['payload']}"
+        if decoded["issues"]:
+            ev += " | " + "; ".join(decoded["issues"])
+        out.append(_finding(sev, "secret", "jwt", "JWT (decoded)", ev[:300], where, flow))
+        return  # one per field
 
 
 def _scan_flags(text: str, where: str, flow: dict[str, Any], out: list[dict[str, Any]]) -> None:
@@ -211,6 +231,15 @@ def scan_flow(flow: dict[str, Any]) -> list[dict[str, Any]]:
     _scan_flags(url, "url", flow, out)
     _scan_flags(req_body, "req_body", flow, out)
     _scan_flags(resp_body, "resp_body", flow, out)
+
+    # JWTs — decode + flag weaknesses.
+    _scan_jwt(url, "url", flow, out)
+    _scan_jwt(req_body, "req_body", flow, out)
+    _scan_jwt(resp_body, "resp_body", flow, out)
+    for side in ("req_headers", "resp_headers"):
+        auth = (flow.get(side) or {}).get("Authorization") or (flow.get(side) or {}).get("authorization")
+        if auth:
+            _scan_jwt(auth, f"{side}:authorization", flow, out)
 
     # Header rules.
     _scan_headers(flow.get("req_headers") or {}, "req", flow, out)

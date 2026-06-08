@@ -44,7 +44,9 @@ Without an API key the collectors and UI still run — only chat is disabled.
 | **aggregator** | FastAPI daemon: collects state, budgets context, proxies chat to Anthropic, serves the UI. | `python -m aggregator.main` |
 | **tmux_poll** | Dumps *every* pane across *all* sessions/windows every 2s. Stdlib only. | `python -m aggregator.tmux_poll` |
 | **tail** | Follows any log/command (Burp, tshark, nmap…) into the context. Stdlib only. | `python -m aggregator.tail burp --file /tmp/burp.log` |
-| **detect** | Detection engine: scans flows, auto-flags findings. Shared by all feeds. | (library; see Web enumeration) |
+| **detect** | Detection engine: scans flows, auto-flags findings (incl. JWT decode). | (library; see Web enumeration) |
+| **decoders / tools** | JWT + magic decoders; agent tool layer (findings/inventory/decode/replay/run). | (library; see Assistant tools) |
+| **inventory / methodology** | Recon site-map + param mining; phase playbook. | `GET /inventory`, `GET /methodology` |
 | **proxy addon** | mitmproxy addon: Burp-level full-traffic feed. | `mitmdump -s proxy/ctf_addon.py -p 8080` |
 | **extension** | MV3 browser extension: page snapshots + request/response **body** capture. | Load unpacked from `extension/` |
 | **ui** | Single-file chat UI with live status pills and streaming replies. | served at `http://127.0.0.1:7331/` |
@@ -107,6 +109,37 @@ the default port.) Findings from both feeds are deduped, so running both is fine
 
 > Inspect only targets you're authorized to test — this captures full bodies,
 > cookies, and tokens.
+
+## Assistant tools: agent mode, Repeater, decode, inventory, methodology
+
+The footer has a small toolbar:
+
+- **🤖 agent** — agent mode. The model can call tools to *investigate*, not just
+  advise: `list_findings`, `get_inventory`, `get_flow` (pull a captured request's
+  full body), `decode`, and `http_request` (send a request and read the response).
+  Tool calls show inline as `🔧 tool(args)`.
+- **▶ run** — additionally lets the agent run a command in your **active tmux pane**
+  (`nmap`, `ffuf`, `curl`…) and read the output. Off by default; enabling it is an
+  explicit opt-in (and implies agent mode). Only enable on a box/engagement where
+  that's acceptable — the model is driving your shell.
+- **⏭ next steps** — asks for a methodology-anchored plan (which phase you're in +
+  the 2–3 highest-value next actions with exact commands).
+- **decode** — JWT (decoded + `alg:none`/weak/expired flags, via PyJWT) and a
+  CyberChef-"magic" multi-decoder (base64/hex/url/rot13/gzip chains; flags results
+  containing a flag).
+- **repeater** — load any captured request, tweak method/URL/headers/body, resend
+  it server-side, and see the response (auto-scanned for findings). The Burp
+  Repeater equivalent; great for iterating on an injection.
+- **inventory** — discovered endpoints, mined parameters (injection candidates),
+  and links found in pages/JS. Also injected into the chat context.
+
+The assistant always frames advice against a **methodology** (recon → scanning →
+enumeration → exploitation → post-exploitation) and names the current phase.
+
+> **Decoders use established libraries** (PyJWT) and Python's stdlib codecs — no
+> hand-rolled crypto. Agent `http_request` and the Repeater can hit any URL you
+> give them; that's intentional for testing, but it means the tool is as
+> trusted as you are. Keep it to authorized targets.
 
 ## LLM providers
 

@@ -10,7 +10,7 @@ import time
 from collections import deque
 from typing import Any
 
-from . import config
+from . import config, inventory
 
 
 class State:
@@ -30,6 +30,11 @@ class State:
         self._max_findings = 500
         # Burp-style target scope (host/URL substrings). Empty = everything.
         self.scope: list[str] = list(config.SCOPE)
+        # Recon inventory + full-flow ring (for the Repeater / agent tools).
+        self.endpoints: dict[tuple[str, str], dict[str, Any]] = {}
+        self.params: set[str] = set()
+        self.links: set[str] = set()
+        self.flows_full: deque[dict[str, Any]] = deque(maxlen=80)
 
     # --- writers ----------------------------------------------------------
     def set_panes(self, panes: dict[str, dict[str, Any]]) -> None:
@@ -86,6 +91,61 @@ class State:
                     self._finding_keys.discard(d.get("key"))
         return added
 
+    def update_inventory(self, flow: dict[str, Any]) -> None:
+        url = flow.get("url", "")
+        if not url:
+            return
+        with self._lock:
+            host, path = inventory.endpoint_key(url)
+            params = inventory.query_params(url) | inventory.body_params(flow.get("req_body"))
+            ep = self.endpoints.setdefault(
+                (host, path), {"host": host, "path": path, "methods": set(),
+                               "statuses": set(), "params": set()})
+            if flow.get("method"):
+                ep["methods"].add(flow["method"])
+            if flow.get("status") not in (None, ""):
+                ep["statuses"].add(flow["status"])
+            ep["params"] |= params
+            self.params |= params
+            # Passive crawl: links found in HTML/JS bodies we haven't seen as endpoints.
+            seen_paths = {p for _, p in self.endpoints}
+            for link in inventory.extract_links(flow.get("resp_body")):
+                if link not in seen_paths:
+                    self.links.add(link)
+            if len(self.endpoints) > 1000 or len(self.links) > 1000:
+                self.links = set(list(self.links)[:1000])
+            # Retain the full flow for replay / agent inspection (bounded body).
+            self.flows_full.append({
+                "method": flow.get("method", "GET"), "url": url,
+                "status": flow.get("status"),
+                "req_headers": flow.get("req_headers") or {},
+                "req_body": (flow.get("req_body") or "")[:20000] or None,
+                "resp_headers": flow.get("resp_headers") or {},
+                "resp_body": (flow.get("resp_body") or "")[:20000] or None,
+            })
+
+    def _inventory_unlocked(self) -> dict[str, Any]:
+        eps = sorted(self.endpoints.values(), key=lambda e: (e["host"], e["path"]))
+        return {
+            "endpoints": [
+                {"host": e["host"], "path": e["path"],
+                 "methods": sorted(e["methods"]),
+                 "statuses": sorted(str(s) for s in e["statuses"]),
+                 "params": sorted(e["params"])}
+                for e in eps[:400]
+            ],
+            "params": sorted(self.params)[:300],
+            "links": sorted(self.links)[:300],
+        }
+
+    def get_inventory(self) -> dict[str, Any]:
+        with self._lock:
+            return self._inventory_unlocked()
+
+    def get_flows_full(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self.flows_full)
+
     def add_app_log(self, app: str, line: str) -> bool:
         with self._lock:
             if app == "burp":
@@ -108,6 +168,7 @@ class State:
                 "wireshark": list(self.wireshark),
                 "flows": list(self.flows),
                 "findings": list(self.findings),
+                "inventory": self._inventory_unlocked(),
                 "last_pane_update": self.last_pane_update,
             }
 
@@ -165,6 +226,8 @@ class State:
                 "findings": len(self.findings),
                 "findings_high": sum(1 for f in self.findings if f.get("severity") == "high"),
                 "scope": list(self.scope),
+                "endpoints": len(self.endpoints),
+                "params": len(self.params),
                 "last_pane_update": self.last_pane_update,
             }
 
