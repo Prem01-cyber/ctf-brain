@@ -23,7 +23,31 @@
   .pill b { color: var(--fg); font-weight: 600; }
   .pill.ok { color: var(--green); border-color: #2ea04366; }
   .pill.bad { color: var(--red); border-color: #f8514966; }
+  .main { flex: 1; display: flex; min-height: 0; }
   #log { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+  #dash { width: 360px; flex-shrink: 0; border-left: 1px solid var(--border); background: var(--panel);
+    overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
+  #dash .card { border: 1px solid var(--border); border-radius: 8px; background: var(--bg); padding: 8px 10px; }
+  #dash .card-h { font: 11px var(--mono); color: var(--muted); letter-spacing: .5px; margin-bottom: 6px; }
+  #dash .muted { color: var(--muted); }
+  .phase { font-size: 15px; font-weight: 600; color: var(--accent); margin-bottom: 6px; }
+  .checklist { display: flex; flex-wrap: wrap; gap: 4px; }
+  .checklist .ph { font: 10px var(--mono); padding: 2px 6px; border-radius: 10px; background: #21262d; color: var(--muted); }
+  .checklist .ph.done { color: var(--green); } .checklist .ph.active { color: var(--accent); border: 1px solid var(--accent); }
+  #d-steps .step { border-left: 2px solid var(--border); padding: 4px 8px; margin: 5px 0; cursor: pointer; border-radius: 0 5px 5px 0; }
+  #d-steps .step:hover { background: #21262d; }
+  #d-steps .step .t { font-size: 12.5px; } #d-steps .step .c { font: 11px var(--mono); color: var(--green); word-break: break-all; }
+  #d-steps .p0 { border-left-color: var(--red); } #d-steps .p1 { border-left-color: #d29922; } #d-steps .p2, #d-steps .p3 { border-left-color: var(--accent); }
+  .assets { font: 12px var(--mono); display: flex; flex-direction: column; gap: 3px; }
+  .assets b { color: var(--muted); font-weight: 600; }
+  #d-flags .flag { font: 12px var(--mono); color: var(--green); word-break: break-all; }
+  #d-tasks .task, #d-notes .note { font-size: 12.5px; padding: 3px 0; display: flex; gap: 6px; align-items: flex-start; }
+  #d-tasks .task input { margin-top: 2px; } #d-tasks .task.done span { text-decoration: line-through; color: var(--muted); }
+  #d-notes .note::before { content: "•"; color: var(--muted); }
+  .addrow { display: flex; gap: 4px; margin-top: 6px; }
+  .addrow input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 5px; padding: 3px 6px; font-size: 12px; }
+  .addrow button { padding: 3px 9px; }
+  @media (max-width: 760px) { #dash { display: none; } }
   .msg { max-width: 860px; width: 100%; align-self: center; }
   .msg .role { font: 11px var(--mono); color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .5px; }
   .bubble { padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border);
@@ -59,6 +83,8 @@
 <body>
   <header>
     <h1>CTF&#8209;<span>Brain</span></h1>
+    <select id="session" title="engagement / session — switch or create"
+      style="background:#21262d;color:var(--fg);border:1px solid var(--border);border-radius:8px;padding:3px 6px;font:12px var(--mono)"></select>
     <div class="pills" id="pills">
       <span class="pill" id="p-api">api …</span>
       <span class="pill" id="p-panes">panes …</span>
@@ -69,14 +95,46 @@
     </div>
   </header>
 
-  <div id="log">
-    <div class="empty" id="empty">
-      <p><b>Ask about what you're looking at.</b></p>
-      <p>The aggregator injects your live tmux panes, browser page, and recent
-      requests into every question. Press <kbd>📷</kbd> to attach a screenshot, or
-      bind a hotkey to <code>touch /tmp/ctf_screenshot_requested</code>.</p>
-      <p><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for newline</p>
+  <div class="main">
+    <div id="log">
+      <div class="empty" id="empty">
+        <p><b>Ask about what you're looking at.</b></p>
+        <p>The aggregator injects your live tmux panes, browser page, and recent
+        requests into every question. The dashboard on the right tracks what's been
+        found and what to do next — per session.</p>
+        <p><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> for newline</p>
+      </div>
     </div>
+
+    <aside id="dash">
+      <div class="card">
+        <div class="card-h">PHASE</div>
+        <div id="d-phase" class="phase">—</div>
+        <div id="d-checklist" class="checklist"></div>
+      </div>
+      <div class="card">
+        <div class="card-h">NEXT STEPS <span class="muted">(click to load)</span></div>
+        <div id="d-steps">—</div>
+      </div>
+      <div class="card">
+        <div class="card-h">ASSETS</div>
+        <div id="d-assets" class="assets">—</div>
+      </div>
+      <div class="card">
+        <div class="card-h">🚩 FLAGS</div>
+        <div id="d-flags" class="muted">none yet</div>
+      </div>
+      <div class="card">
+        <div class="card-h">TASKS</div>
+        <div id="d-tasks"></div>
+        <div class="addrow"><input id="taskIn" placeholder="add task…"><button id="taskAdd">+</button></div>
+      </div>
+      <div class="card">
+        <div class="card-h">NOTES</div>
+        <div id="d-notes"></div>
+        <div class="addrow"><input id="noteIn" placeholder="add note…"><button id="noteAdd">+</button></div>
+      </div>
+    </aside>
   </div>
 
   <footer>
@@ -399,9 +457,86 @@ async function saveScope() {
 $("scope").addEventListener("change", saveScope);
 $("scope").addEventListener("keydown", (e) => { if (e.key === "Enter") { saveScope(); $("scope").blur(); } });
 
+// --- dashboard ---
+function renderDash(e) {
+  $("d-phase").textContent = e.phase;
+  $("d-checklist").innerHTML = (e.checklist || []).map((c) =>
+    `<span class="ph ${c.status}" title="${escapeHtml(c.goal)}">${c.phase}</span>`).join("");
+
+  $("d-steps").innerHTML = (e.next_steps || []).map((s, i) =>
+    `<div class="step p${s.priority}" data-i="${i}">
+       <div class="t">${escapeHtml(s.title)} <span class="muted" style="font-size:11px">— ${escapeHtml(s.why)}</span></div>
+       ${s.command ? `<div class="c">${escapeHtml(s.command)}</div>` : ""}
+     </div>`).join("") || "<span class='muted'>—</span>";
+  $("d-steps")._steps = e.next_steps || [];
+
+  const a = e.assets || {};
+  const row = (k, v) => v && v.length ? `<div><b>${k}:</b> ${escapeHtml(Array.isArray(v) ? v.join(", ") : String(v))}</div>` : "";
+  $("d-assets").innerHTML =
+    row("hosts", a.hosts) +
+    (a.open_ports && a.open_ports.length ? `<div><b>ports:</b> ${a.open_ports.map((p) => p.port + "/" + p.service).join(", ")}</div>` : "") +
+    `<div><b>endpoints:</b> ${a.endpoints || 0}</div>` +
+    row("params", a.params) + row("tech", a.technologies) +
+    row("tokens", (a.tokens || []).map((t) => t.slice(0, 40))) +
+    row("emails", a.emails) + row("secrets", a.secrets) || "<span class='muted'>—</span>";
+
+  $("d-flags").innerHTML = (e.flags || []).length
+    ? e.flags.map((f) => `<div class="flag">🚩 ${escapeHtml(f)}</div>`).join("") : "<span class='muted'>none yet</span>";
+
+  $("d-tasks").innerHTML = (e.tasks || []).map((t) =>
+    `<div class="task ${t.done ? "done" : ""}"><input type="checkbox" data-id="${t.id}" ${t.done ? "checked" : ""}><span>${escapeHtml(t.text)}</span></div>`).join("");
+  $("d-notes").innerHTML = (e.notes || []).map((n) => `<div class="note">${escapeHtml(n.text)}</div>`).join("");
+}
+async function pollEngagement() {
+  try { renderDash(await fetch(API + "/engagement").then((r) => r.json())); } catch (_) {}
+}
+$("d-steps").addEventListener("click", (ev) => {
+  const el = ev.target.closest(".step"); if (!el) return;
+  const s = $("d-steps")._steps[+el.dataset.i];
+  $("input").value = s.command
+    ? `I want to: ${s.title}. Proposed: ${s.command} — walk me through it.`
+    : s.title;
+  $("input").focus();
+});
+$("d-tasks").addEventListener("change", (ev) => {
+  if (ev.target.type === "checkbox")
+    fetch(API + "/task/toggle", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: +ev.target.dataset.id, done: ev.target.checked }) }).then(pollEngagement);
+});
+async function addItem(path, input) {
+  const text = input.value.trim(); if (!text) return;
+  input.value = "";
+  await fetch(API + path, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text }) });
+  pollEngagement();
+}
+$("taskAdd").onclick = () => addItem("/task", $("taskIn"));
+$("noteAdd").onclick = () => addItem("/note", $("noteIn"));
+$("taskIn").addEventListener("keydown", (e) => { if (e.key === "Enter") addItem("/task", $("taskIn")); });
+$("noteIn").addEventListener("keydown", (e) => { if (e.key === "Enter") addItem("/note", $("noteIn")); });
+
+// --- sessions ---
+async function loadSessions() {
+  const { current, sessions } = await fetch(API + "/sessions").then((r) => r.json());
+  const opts = sessions.map((s) => `<option ${s === current ? "selected" : ""}>${escapeHtml(s)}</option>`).join("");
+  $("session").innerHTML = opts + `<option value="__new__">＋ new…</option>`;
+  if (!sessions.includes(current)) $("session").insertAdjacentHTML("afterbegin", `<option selected>${escapeHtml(current)}</option>`);
+}
+$("session").onchange = async (e) => {
+  let name = e.target.value;
+  if (name === "__new__") { name = (prompt("New engagement name:") || "").trim(); if (!name) return loadSessions(); }
+  await fetch(API + "/session", { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }) });
+  history.length = 0; $("log").innerHTML = "";
+  loadSessions(); loadScope(); pollEngagement();
+};
+
 loadScope();
+loadSessions();
 poll();
+pollEngagement();
 setInterval(poll, 2500);
+setInterval(pollEngagement, 3000);
 $("input").focus();
 </script>
 </body>

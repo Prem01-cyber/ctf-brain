@@ -14,7 +14,7 @@ from typing import Any
 
 import httpx
 
-from . import decoders, detect
+from . import decoders, detect, engagement
 from .state import STATE
 
 # Provider-neutral tool specs: name, description, JSON-schema properties, required.
@@ -49,6 +49,20 @@ TOOLS: list[dict[str, Any]] = [
          "headers": {"type": "object", "description": "header name->value"},
          "body": {"type": "string"}},
      "required": ["method", "url"]},
+    {"name": "get_engagement",
+     "description": "The dynamic engagement picture: current phase, discovered "
+                    "assets (hosts/ports/endpoints/params/creds/flags), and "
+                    "context-driven next steps. Read this to plan.",
+     "properties": {}, "required": []},
+    {"name": "add_note",
+     "description": "Record a note/observation in the session's engagement state.",
+     "properties": {"text": {"type": "string"}}, "required": ["text"]},
+    {"name": "add_task",
+     "description": "Add a follow-up task to the session checklist.",
+     "properties": {"text": {"type": "string"}}, "required": ["text"]},
+    {"name": "record_flag",
+     "description": "Record a captured flag for this session.",
+     "properties": {"flag": {"type": "string"}}, "required": ["flag"]},
     {"name": "run_command",
      "description": "Run a shell command in a tmux pane and return its output. Use for "
                     "scans/enumeration (nmap, ffuf, curl). Requires the operator to have "
@@ -138,6 +152,23 @@ async def run_tool(name: str, args: dict[str, Any], allow_exec: bool = False) ->
             return json.dumps({"status": res["status"], "headers": hdrs,
                                "body": res["body"][:8000],
                                "findings": [f["title"] for f in res["findings"]]})[:9000]
+
+        if name == "get_engagement":
+            eng = engagement.derive(STATE.snapshot())
+            return json.dumps({k: eng[k] for k in
+                               ("phase", "assets", "findings_summary", "flags",
+                                "next_steps", "tasks")})[:7000]
+
+        if name == "add_note":
+            STATE.add_note(args.get("text", ""))
+            return "note recorded"
+
+        if name == "add_task":
+            STATE.add_task(args.get("text", ""))
+            return "task added"
+
+        if name == "record_flag":
+            return "flag recorded" if STATE.add_flag(args.get("flag", "")) else "already recorded"
 
         if name == "run_command":
             if not allow_exec:

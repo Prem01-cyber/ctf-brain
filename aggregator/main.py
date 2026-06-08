@@ -13,11 +13,32 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import (budget, config, decoders, detect, llm, methodology,
+import contextlib
+
+from . import (budget, config, decoders, detect, engagement, llm, methodology,
                providers, screenshot, tools)
 from .state import STATE
 
-app = FastAPI(title="ctf-brain aggregator", version="0.1.0")
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the configured engagement and autosave it periodically + on shutdown.
+    STATE.load(config.SESSION)
+
+    async def autosave():
+        while True:
+            await asyncio.sleep(15)
+            await asyncio.to_thread(STATE.save)
+
+    task = asyncio.ensure_future(autosave())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(STATE.save, True)
+
+
+app = FastAPI(title="ctf-brain aggregator", version="0.1.0", lifespan=lifespan)
 
 # Local tool: the browser extension and UI both call cross-origin to localhost.
 app.add_middleware(
@@ -125,6 +146,44 @@ async def get_inventory() -> dict[str, Any]:
 @app.get("/methodology")
 async def get_methodology() -> dict[str, Any]:
     return {"phases": methodology.checklist()}
+
+
+@app.get("/engagement")
+async def get_engagement() -> dict[str, Any]:
+    """Dynamic engagement view: inferred phase, discovered assets, and the
+    context-driven next steps + tracked notes/tasks/flags for this session."""
+    return engagement.derive(STATE.snapshot())
+
+
+@app.post("/note")
+async def add_note(payload: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True, "note": STATE.add_note(payload.get("text", ""))}
+
+
+@app.post("/task")
+async def add_task(payload: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True, "task": STATE.add_task(payload.get("text", ""), payload.get("done", False))}
+
+
+@app.post("/task/toggle")
+async def toggle_task(payload: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": STATE.toggle_task(int(payload.get("id", -1)), payload.get("done"))}
+
+
+@app.post("/flag")
+async def add_flag(payload: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": STATE.add_flag(str(payload.get("flag", "")))}
+
+
+@app.get("/sessions")
+async def list_sessions() -> dict[str, Any]:
+    return {"current": STATE.session, "sessions": STATE.list_sessions()}
+
+
+@app.post("/session")
+async def switch_session(payload: dict[str, Any]) -> dict[str, Any]:
+    name = str(payload.get("name", "")).strip() or "default"
+    return {"ok": True, "status": await asyncio.to_thread(STATE.switch_session, name)}
 
 
 @app.post("/decode")

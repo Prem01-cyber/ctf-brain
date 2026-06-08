@@ -36,6 +36,12 @@ def reset_state():
     STATE.params = set()
     STATE.links = set()
     STATE.flows_full.clear()
+    STATE.notes = []
+    STATE.tasks = []
+    STATE.flags = []
+    STATE.session = "default"
+    STATE._counter = 0
+    STATE._dirty = False
     STATE.last_pane_update = None
     yield
 
@@ -476,3 +482,51 @@ def test_chat_agent_mode_routes_to_stream_agent(client, monkeypatch):
                                    "agent": True, "allow_exec": True})
     assert r.text == "agent-reply"
     assert seen["allow_exec"] is True
+
+
+# --- dynamic engagement ----------------------------------------------------
+def test_engagement_phase_and_next_steps(client):
+    client.post("/flow", json={"method": "GET", "url": "http://t.htb/p?id=1", "status": 500,
+                               "resp_body": "You have an error in your SQL syntax"})
+    e = client.get("/engagement").json()
+    assert e["phase"] == "Exploitation"
+    titles = " ".join(s["title"] for s in e["next_steps"])
+    assert "SQLi" in titles
+    assert "id" in e["assets"]["params"]
+
+
+def test_engagement_parses_ports_from_pane(client):
+    client.post("/panes", json={"panes": {"a:0:0": _pane("a", "0", "0", "bash",
+                "22/tcp open ssh\n80/tcp open http", active=True)}})
+    ports = client.get("/engagement").json()["assets"]["open_ports"]
+    assert {p["port"] for p in ports} == {"22", "80"}
+
+
+def test_notes_tasks_flags_tracked(client):
+    client.post("/note", json={"text": "LFI on ?file"})
+    tid = client.post("/task", json={"text": "run sqlmap"}).json()["task"]["id"]
+    client.post("/task/toggle", json={"id": tid, "done": True})
+    client.post("/flag", json={"flag": "flag{tracked}"})
+    e = client.get("/engagement").json()
+    assert e["notes"][0]["text"] == "LFI on ?file"
+    assert e["tasks"][0]["done"] is True
+    assert "flag{tracked}" in e["flags"]
+
+
+def test_sessions_isolated_and_persisted(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    client.post("/note", json={"text": "alpha note"})        # in 'default'
+    client.post("/session", json={"name": "beta"})           # switch (saves default)
+    assert client.get("/engagement").json()["notes"] == []   # beta is empty
+    client.post("/note", json={"text": "beta note"})
+    client.post("/session", json={"name": "default"})        # back
+    notes = [n["text"] for n in client.get("/engagement").json()["notes"]]
+    assert notes == ["alpha note"]
+    assert "beta" in client.get("/sessions").json()["sessions"]
+
+
+def test_tool_get_engagement_and_add_note():
+    out = _run(tools.run_tool("get_engagement", {}))
+    assert "phase" in out
+    assert "recorded" in _run(tools.run_tool("add_note", {"text": "from agent"}))
+    assert any(n["text"] == "from agent" for n in STATE.notes)

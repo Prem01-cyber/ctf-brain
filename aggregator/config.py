@@ -73,6 +73,12 @@ SCREENSHOT_FLAG: str = os.environ.get("CTF_SCREENSHOT_FLAG", "/tmp/ctf_screensho
 SCOPE: list[str] = [s.strip().lower() for s in os.environ.get("CTF_SCOPE", "").split(",")
                     if s.strip()]
 
+# --- Sessions / persistence ------------------------------------------------
+# Each engagement (findings, inventory, notes, tasks, flags, scope) is saved here
+# as <name>.json so it survives restarts and you can switch between targets.
+DATA_DIR: str = os.path.expanduser(os.environ.get("CTF_DATA_DIR", "~/.ctf-brain/engagements"))
+SESSION: str = os.environ.get("CTF_SESSION", "default")
+
 # --- Misc ------------------------------------------------------------------
 # Browser snapshots/app logs older than this (seconds) are treated as stale and
 # dropped from the context so the LLM isn't shown a page you closed an hour ago.

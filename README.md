@@ -47,6 +47,7 @@ Without an API key the collectors and UI still run — only chat is disabled.
 | **detect** | Detection engine: scans flows, auto-flags findings (incl. JWT decode). | (library; see Web enumeration) |
 | **decoders / tools** | JWT + magic decoders; agent tool layer (findings/inventory/decode/replay/run). | (library; see Assistant tools) |
 | **inventory / methodology** | Recon site-map + param mining; phase playbook. | `GET /inventory`, `GET /methodology` |
+| **engagement / sessions** | Dynamic phase + next-steps; per-session notes/tasks/flags, persisted. | `GET /engagement`, `GET /sessions` |
 | **proxy addon** | mitmproxy addon: Burp-level full-traffic feed. | `mitmdump -s proxy/ctf_addon.py -p 8080` |
 | **extension** | MV3 browser extension: page snapshots + request/response **body** capture. | Load unpacked from `extension/` |
 | **ui** | Single-file chat UI with live status pills and streaming replies. | served at `http://127.0.0.1:7331/` |
@@ -141,6 +142,33 @@ enumeration → exploitation → post-exploitation) and names the current phase.
 > give them; that's intentional for testing, but it means the tool is as
 > trusted as you are. Keep it to authorized targets.
 
+## Cockpit: dynamic engagement tracking (the dashboard)
+
+The right-hand **dashboard** turns the chat into a pentest cockpit. It's driven by
+a dynamic engagement model ([engagement.py](aggregator/engagement.py)) — *not* a
+fixed checklist — recomputed from live state:
+
+- **Phase** — inferred from evidence (ports → Scanning, endpoints/params → Enumeration,
+  SQL errors / `alg:none` JWTs → Exploitation) with a phase strip showing progress.
+- **Next steps** — context-driven, prioritized suggestions with exact commands
+  (dump an exposed `.git`, `sqlmap` a parameter that threw a SQL error, brute a
+  discovered login, `ffuf` mined params, enumerate an open service…). Click one to
+  load it into the chat.
+- **Assets** — hosts, open ports/services (parsed from your nmap pane), endpoints,
+  parameters, tech/versions, tokens, emails, secrets — harvested from findings,
+  inventory, and terminals.
+- **🚩 Flags**, **Tasks** (add/check off), **Notes** (add) — your tracked state.
+
+**Sessions / persistence.** Each engagement is a named session, isolated and saved
+to disk (`CTF_DATA_DIR`, default `~/.ctf-brain/engagements/<name>.json`) — findings,
+inventory, scope, notes, tasks, flags. Switch or create from the header dropdown;
+state survives restarts (autosaved every 15s and on exit). Pick the session per
+target so each box keeps its own picture.
+
+The chat agent shares this state via tools (`get_engagement`, `add_note`,
+`add_task`, `record_flag`), so it can plan from — and contribute to — the same
+tracker you see.
+
 ## LLM providers
 
 Chat is provider-agnostic (see `aggregator/providers.py`):
@@ -193,6 +221,8 @@ All via env vars (see `.env.example`). Highlights:
 |---|---|---|
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | At least one required for chat. |
 | `CTF_SCOPE` | — | Comma-separated target host filters (Burp-style scope). Blank = all. |
+| `CTF_SESSION` | `default` | Engagement/session name to load on start. |
+| `CTF_DATA_DIR` | `~/.ctf-brain/engagements` | Where sessions are persisted. |
 | `CTF_PROVIDER` | auto | `anthropic` or `openai`; auto-detected from keys. |
 | `CTF_MODEL` | per-provider | `claude-opus-4-8` (anthropic) / `gpt-4o` (openai). |
 | `OPENAI_BASE_URL` | — | Point the openai provider at any compatible endpoint. |

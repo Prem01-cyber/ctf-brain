@@ -5,6 +5,8 @@ is plenty. Collectors POST in; /context and /chat read out.
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections import deque
@@ -35,6 +37,16 @@ class State:
         self.params: set[str] = set()
         self.links: set[str] = set()
         self.flows_full: deque[dict[str, Any]] = deque(maxlen=80)
+        # Per-session engagement tracking (persisted to disk).
+        self.session: str = config.SESSION
+        self.notes: list[dict[str, Any]] = []
+        self.tasks: list[dict[str, Any]] = []
+        self.flags: list[str] = []
+        self._counter = 0
+        self._dirty = False
+
+    def _touch(self) -> None:
+        self._dirty = True
 
     # --- writers ----------------------------------------------------------
     def set_panes(self, panes: dict[str, dict[str, Any]]) -> None:
@@ -83,6 +95,7 @@ class State:
                 f["count"] = 1
                 self.findings.append(f)
                 added += 1
+                self._dirty = True
             # Cap memory: drop oldest findings (keep newest).
             if len(self.findings) > self._max_findings:
                 drop = self.findings[: len(self.findings) - self._max_findings]
@@ -123,6 +136,7 @@ class State:
                 "resp_headers": flow.get("resp_headers") or {},
                 "resp_body": (flow.get("resp_body") or "")[:20000] or None,
             })
+            self._dirty = True
 
     def _inventory_unlocked(self) -> dict[str, Any]:
         eps = sorted(self.endpoints.values(), key=lambda e: (e["host"], e["path"]))
@@ -169,6 +183,10 @@ class State:
                 "flows": list(self.flows),
                 "findings": list(self.findings),
                 "inventory": self._inventory_unlocked(),
+                "notes": list(self.notes),
+                "tasks": list(self.tasks),
+                "flags": list(self.flags),
+                "session": self.session,
                 "last_pane_update": self.last_pane_update,
             }
 
@@ -183,6 +201,7 @@ class State:
     def set_scope(self, scope: list[str]) -> None:
         with self._lock:
             self.scope = [s.strip().lower() for s in scope if s and s.strip()]
+            self._dirty = True
 
     def in_scope(self, url: str) -> bool:
         with self._lock:
@@ -190,6 +209,40 @@ class State:
                 return True
             u = (url or "").lower()
             return any(s in u for s in self.scope)
+
+    # --- engagement tracking ---------------------------------------------
+    def add_note(self, text: str) -> dict[str, Any]:
+        with self._lock:
+            self._counter += 1
+            note = {"id": self._counter, "text": str(text), "t": time.time()}
+            self.notes.append(note)
+            self._dirty = True
+            return note
+
+    def add_task(self, text: str, done: bool = False) -> dict[str, Any]:
+        with self._lock:
+            self._counter += 1
+            task = {"id": self._counter, "text": str(text), "done": bool(done), "t": time.time()}
+            self.tasks.append(task)
+            self._dirty = True
+            return task
+
+    def toggle_task(self, task_id: int, done: bool | None = None) -> bool:
+        with self._lock:
+            for t in self.tasks:
+                if t["id"] == task_id:
+                    t["done"] = (not t["done"]) if done is None else bool(done)
+                    self._dirty = True
+                    return True
+            return False
+
+    def add_flag(self, flag: str) -> bool:
+        with self._lock:
+            if flag and flag not in self.flags:
+                self.flags.append(flag)
+                self._dirty = True
+                return True
+            return False
 
     def get_screenshot_b64(self) -> str | None:
         with self._lock:
@@ -203,6 +256,96 @@ class State:
             data = self.screenshot["data"]
             self.screenshot = None
             return data
+
+    # --- persistence / sessions ------------------------------------------
+    def _persist_dict(self) -> dict[str, Any]:
+        """Lock-free serializable snapshot of the durable engagement state."""
+        return {
+            "session": self.session,
+            "scope": list(self.scope),
+            "findings": list(self.findings),
+            "finding_keys": list(self._finding_keys),
+            "endpoints": [
+                {"host": h, "path": p, "methods": sorted(e["methods"]),
+                 "statuses": sorted(str(s) for s in e["statuses"]),
+                 "params": sorted(e["params"])}
+                for (h, p), e in self.endpoints.items()],
+            "params": sorted(self.params),
+            "links": sorted(self.links),
+            "flows_full": list(self.flows_full),
+            "notes": list(self.notes),
+            "tasks": list(self.tasks),
+            "flags": list(self.flags),
+            "counter": self._counter,
+        }
+
+    def _load_dict(self, d: dict[str, Any]) -> None:
+        self.session = d.get("session", self.session)
+        self.scope = d.get("scope", [])
+        self.findings = d.get("findings", [])
+        self._finding_keys = set(d.get("finding_keys", []))
+        self.endpoints = {
+            (e["host"], e["path"]): {"host": e["host"], "path": e["path"],
+                                     "methods": set(e.get("methods", [])),
+                                     "statuses": set(e.get("statuses", [])),
+                                     "params": set(e.get("params", []))}
+            for e in d.get("endpoints", [])}
+        self.params = set(d.get("params", []))
+        self.links = set(d.get("links", []))
+        self.flows_full = deque(d.get("flows_full", []), maxlen=80)
+        self.notes = d.get("notes", [])
+        self.tasks = d.get("tasks", [])
+        self.flags = d.get("flags", [])
+        self._counter = d.get("counter", 0)
+
+    def _path(self, name: str) -> str:
+        safe = "".join(c for c in name if c.isalnum() or c in "-_.") or "default"
+        return os.path.join(config.DATA_DIR, f"{safe}.json")
+
+    def save(self, force: bool = False) -> bool:
+        with self._lock:
+            if not self._dirty and not force:
+                return False
+            data = self._persist_dict()
+            self._dirty = False
+        os.makedirs(config.DATA_DIR, exist_ok=True)
+        tmp = self._path(data["session"]) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, self._path(data["session"]))
+        return True
+
+    def load(self, name: str) -> bool:
+        path = self._path(name)
+        if not os.path.exists(path):
+            return False
+        with open(path) as f:
+            data = json.load(f)
+        with self._lock:
+            self._load_dict(data)
+            self._dirty = False
+        return True
+
+    def switch_session(self, name: str) -> dict[str, Any]:
+        self.save(force=True)  # persist current
+        with self._lock:
+            # Reset live + durable state, keep transient collectors (panes/browser).
+            self.endpoints, self.params, self.links = {}, set(), set()
+            self.flows_full.clear()
+            self.findings, self._finding_keys = [], set()
+            self.flows.clear()
+            self.notes, self.tasks, self.flags = [], [], []
+            self.scope, self._counter = [], 0
+            self.session = name
+            self._dirty = False
+        self.load(name)  # repopulate if it exists on disk
+        return self.status()
+
+    def list_sessions(self) -> list[str]:
+        try:
+            return sorted(f[:-5] for f in os.listdir(config.DATA_DIR) if f.endswith(".json"))
+        except OSError:
+            return []
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -228,6 +371,10 @@ class State:
                 "scope": list(self.scope),
                 "endpoints": len(self.endpoints),
                 "params": len(self.params),
+                "session": self.session,
+                "notes": len(self.notes),
+                "tasks": len(self.tasks),
+                "flags": len(self.flags),
                 "last_pane_update": self.last_pane_update,
             }
 
