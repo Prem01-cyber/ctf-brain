@@ -55,14 +55,14 @@
     }
   }
 
-  // Relay request events from the MAIN-world hook — but never from the
-  // aggregator's own UI tab (its /health & /status polling is not target traffic).
+  // Relay HTTP flows from the MAIN-world hook — but never from the aggregator's
+  // own UI tab (its /health & /status polling is not target traffic).
   window.addEventListener("message", (event) => {
     if (event.source !== window) return;
     if (isAggregator()) return;
     const d = event.data;
     if (!d || d.source !== "ctfbrain-inject" || !d.payload) return;
-    send({ type: "xhr", data: d.payload });
+    send({ type: "flow", data: d.payload });
   });
 
   // Send a snapshot promptly, then on an interval. Skip when tab is hidden to

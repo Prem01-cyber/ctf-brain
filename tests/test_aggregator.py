@@ -6,7 +6,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from aggregator import budget, config, llm, providers, screenshot
+from aggregator import budget, config, detect, llm, providers, screenshot
 from aggregator.main import app
 from aggregator.state import STATE
 
@@ -19,6 +19,10 @@ def reset_state():
     STATE.screenshot = None
     STATE.burp.clear()
     STATE.wireshark.clear()
+    STATE.flows.clear()
+    STATE.findings = []
+    STATE._finding_keys = set()
+    STATE.scope = []
     STATE.last_pane_update = None
     yield
 
@@ -208,3 +212,138 @@ def test_provider_autodetect(monkeypatch):
 def test_get_provider_falls_back_to_anthropic():
     assert providers.get_provider("nonexistent").name == "anthropic"
     assert providers.get_provider("openai").name == "openai"
+
+
+# --- detection engine ------------------------------------------------------
+def _rules(flow):
+    return {f["rule"] for f in detect.scan_flow(flow)}
+
+
+def test_detect_flag_and_secrets_in_body():
+    flow = {"url": "http://t/x", "resp_body":
+            "welcome flag{w3b_3num} key AKIAIOSFODNN7EXAMPLE done"}
+    rules = _rules(flow)
+    assert "flag" in rules
+    assert "aws_access_key" in rules
+
+
+def test_detect_private_key_high_severity():
+    flow = {"url": "http://t/k", "resp_body": "-----BEGIN RSA PRIVATE KEY-----\nMII..."}
+    fs = detect.scan_flow(flow)
+    assert any(f["rule"] == "private_key" and f["severity"] == "high" for f in fs)
+
+
+def test_detect_sql_error_as_injection_signal():
+    flow = {"url": "http://t/p?id=1'", "resp_body":
+            "You have an error in your SQL syntax near ''' at line 1"}
+    assert "sql_error" in _rules(flow)
+
+
+def test_detect_exposed_endpoints_from_url():
+    assert "exposed_vcs" in _rules({"url": "http://t/.git/config"})
+    assert "exposed_env" in _rules({"url": "http://t/.env"})
+    assert "admin_panel" in _rules({"url": "http://t/admin/"})
+
+
+def test_detect_cors_and_cookie_misconfig():
+    flow = {
+        "url": "https://t/api",
+        "resp_headers": {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Credentials": "true",
+            "Set-Cookie": "session=abc; Path=/",
+        },
+    }
+    rules = _rules(flow)
+    assert "cors_wildcard_creds" in rules
+    assert "cookie_no_httponly" in rules
+    assert "cookie_no_secure" in rules
+
+
+def test_detect_clean_flow_is_quiet():
+    assert detect.scan_flow({"url": "http://t/style.css", "resp_body": "body{color:red}"}) == []
+
+
+def test_flag_ignores_minified_js_blocks():
+    js = "self.AMP=self.AMP||[];try{n=t.evaluate(r)}finally{r=null}else{x()}"
+    assert "flag" not in _rules({"url": "http://t/v0.js", "resp_body": js})
+
+
+def test_flag_still_matches_real_flag_with_custom_prefix():
+    assert "flag" in _rules({"url": "http://t/", "resp_body": "picoCTF{custom_prefix_ok}"})
+    assert "flag" in _rules({"url": "http://t/", "resp_body": "HTB{a-real_flag.123}"})
+
+
+def test_secret_assignment_needs_separator():
+    # Prose with a space (no := separator) must not trigger.
+    assert "secret_assignment" not in _rules(
+        {"url": "http://t/", "resp_body": "manage your password preferences here"})
+    assert "secret_assignment" in _rules(
+        {"url": "http://t/", "resp_body": 'password="s3cr3tValue"'})
+
+
+def test_tech_disclosure_dedupes_across_urls():
+    # Same Server value on different endpoints → one finding.
+    f1 = detect.scan_flow({"url": "http://t/a", "resp_headers": {"Server": "ESF"}})
+    f2 = detect.scan_flow({"url": "http://t/b", "resp_headers": {"Server": "ESF"}})
+    assert f1[0]["key"] == f2[0]["key"]
+
+
+def test_finding_key_is_stable_for_dedup():
+    flow = {"url": "http://t/x?a=1", "resp_body": "flag{abc}"}
+    k1 = detect.scan_flow(flow)[0]["key"]
+    flow2 = {"url": "http://t/x?a=2", "resp_body": "flag{abc}"}  # query differs only
+    k2 = detect.scan_flow(flow2)[0]["key"]
+    assert k1 == k2  # dedup ignores query string
+
+
+# --- flow ingestion + findings surface -------------------------------------
+def test_flow_endpoint_scans_and_dedups(client):
+    flow = {"method": "GET", "url": "http://t/.env", "status": 200,
+            "resp_body": "DB_PASSWORD=hunter2 flag{env_leak}"}
+    r1 = client.post("/flow", json=flow).json()
+    assert r1["new"] >= 2  # exposed_env + flag (+ secret_assignment)
+    r2 = client.post("/flow", json=flow).json()
+    assert r2["new"] == 0  # identical flow → all deduped
+
+
+def test_findings_appear_in_context_and_endpoint(client):
+    client.post("/flow", json={"method": "GET", "url": "http://t/q",
+                               "resp_body": "flag{in_context}"})
+    assert "flag{in_context}" in client.get("/context").json()["rendered"]
+    fr = client.get("/findings").json()
+    assert fr["count"] >= 1
+    assert fr["findings"][0]["severity"] == "high"  # sorted high-first
+
+
+def test_status_counts_findings(client):
+    client.post("/flow", json={"url": "http://t/.git/config", "method": "GET"})
+    st = client.get("/status").json()
+    assert st["findings"] >= 1
+    assert st["findings_high"] >= 1
+
+
+# --- target scope ----------------------------------------------------------
+def test_scope_filters_out_of_scope_flows(client):
+    client.post("/scope", json={"scope": "target.htb"})
+    assert client.get("/scope").json()["scope"] == ["target.htb"]
+    # Out-of-scope (e.g. your own Gmail) is dropped, no findings.
+    r = client.post("/flow", json={"url": "https://mail.google.com/x?key=AIzaSyAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                                   "method": "GET"})
+    assert r.json().get("skipped") == "out-of-scope"
+    assert client.get("/status").json()["findings"] == 0
+    # In-scope target is scanned.
+    client.post("/flow", json={"url": "http://target.htb/.git/config", "method": "GET"})
+    assert client.get("/status").json()["findings"] >= 1
+
+
+def test_scope_filters_browser_snapshot(client):
+    client.post("/scope", json={"scope": ["target.htb"]})
+    client.post("/browser", json={"url": "https://mail.google.com/inbox", "title": "Inbox"})
+    assert client.get("/status").json()["browser_url"] is None
+    client.post("/browser", json={"url": "http://target.htb/login", "title": "Login"})
+    assert client.get("/status").json()["browser_url"] == "http://target.htb/login"
+
+
+def test_empty_scope_allows_everything(client):
+    assert STATE.in_scope("http://anything/") is True

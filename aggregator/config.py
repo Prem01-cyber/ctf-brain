@@ -66,6 +66,13 @@ PANE_CAPTURE_LINES: int = _int("CTF_PANE_CAPTURE_LINES", 200)
 # Flag file a window-manager hotkey can `touch` to request a screenshot.
 SCREENSHOT_FLAG: str = os.environ.get("CTF_SCREENSHOT_FLAG", "/tmp/ctf_screenshot_requested")
 
+# --- Target scope ----------------------------------------------------------
+# Comma-separated host/URL substrings. When set, only matching flows are scanned
+# and stored (Burp-style scope) — keeps your own browsing out of the findings.
+# Empty = everything in scope. Settable at runtime via the UI / POST /scope.
+SCOPE: list[str] = [s.strip().lower() for s in os.environ.get("CTF_SCOPE", "").split(",")
+                    if s.strip()]
+
 # --- Misc ------------------------------------------------------------------
 # Browser snapshots/app logs older than this (seconds) are treated as stale and
 # dropped from the context so the LLM isn't shown a page you closed an hour ago.

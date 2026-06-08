@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from . import config
+from . import config, detect
 
 
 def estimate_tokens(text: str) -> int:
@@ -42,7 +42,8 @@ def build_context(state: dict[str, Any], budget_tokens: int | None = None) -> di
     used = 0
     truncated = False
     chunks: list[str] = []
-    sections: dict[str, Any] = {"panes": [], "browser": None, "screenshot": False, "apps": {}}
+    sections: dict[str, Any] = {"panes": [], "findings": 0, "browser": None,
+                                "screenshot": False, "apps": {}}
 
     def add(text: str) -> bool:
         """Append a chunk if it fits. Returns False once the budget is exhausted."""
@@ -72,6 +73,22 @@ def build_context(state: dict[str, Any], budget_tokens: int | None = None) -> di
         if not add(block):
             break
         sections["panes"].append({"location": loc, "command": cmd, "active": active})
+
+    # --- Priority ~1.5: detection findings (the actionable enumeration gold) -
+    findings = state.get("findings", [])
+    if findings:
+        ranked = sorted(findings, key=lambda f: detect.severity_rank(f.get("severity", "info")))
+        lines = ["### detected (auto-flagged from proxied/browser traffic)"]
+        shown = 0
+        for f in ranked[:40]:
+            lines.append(
+                f"[{f.get('severity', '?').upper()}] {f.get('title', f.get('rule'))} "
+                f"— {f.get('method', '')} {f.get('url', '')} "
+                f"({f.get('where', '')}: {f.get('evidence', '')})"
+            )
+            shown += 1
+        if add("\n".join(lines)):
+            sections["findings"] = shown
 
     # --- Priority 2: browser (selection > url/title > visible body) ----------
     browser = state.get("browser")

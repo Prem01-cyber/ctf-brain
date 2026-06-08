@@ -39,8 +39,11 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg.type === "snapshot") {
     console.debug(`${LOG} snapshot from ${from} url=${msg.data && msg.data.url}`);
     post("/browser", msg.data);
+  } else if (msg.type === "flow") {
+    console.debug(`${LOG} flow ${msg.data && msg.data.method} ${msg.data && msg.data.url} ` +
+                  `(${msg.data && msg.data.status})`);
+    post("/flow", msg.data);
   } else if (msg.type === "xhr") {
-    console.debug(`${LOG} xhr ${msg.data && msg.data.method} ${msg.data && msg.data.url}`);
-    post("/xhr", msg.data);
+    post("/xhr", msg.data); // legacy
   }
 });

@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from . import budget, config, llm, providers, screenshot
+from . import budget, config, detect, llm, providers, screenshot
 from .state import STATE
 
 app = FastAPI(title="ctf-brain aggregator", version="0.1.0")
@@ -72,6 +72,10 @@ async def recv_panes(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/browser")
 async def recv_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    # Respect target scope so out-of-scope pages (your own browsing) don't leak
+    # into the context.
+    if not STATE.in_scope(payload.get("url", "")):
+        return {"ok": True, "skipped": "out-of-scope"}
     STATE.set_browser(payload)
     return {"ok": True}
 
@@ -80,6 +84,48 @@ async def recv_browser(payload: dict[str, Any]) -> dict[str, Any]:
 async def recv_xhr(payload: dict[str, Any]) -> dict[str, Any]:
     STATE.add_xhr(payload)
     return {"ok": True}
+
+
+@app.post("/flow")
+async def recv_flow(payload: dict[str, Any]) -> dict[str, Any]:
+    """Ingest an HTTP flow (from the extension hook or the mitmproxy addon),
+    scan it for findings, and store a compact summary + any new findings."""
+    if not STATE.in_scope(payload.get("url", "")):
+        return {"ok": True, "skipped": "out-of-scope"}
+    findings = detect.scan_flow(payload)
+    summary = {
+        "method": payload.get("method", "GET"),
+        "url": payload.get("url", ""),
+        "status": payload.get("status"),
+        "source": payload.get("source", ""),
+        "t": payload.get("t"),
+        "findings": len(findings),
+    }
+    # Keep the lightweight recent-requests list (browser context) in sync.
+    STATE.add_xhr({
+        "method": summary["method"], "url": summary["url"], "status": summary["status"],
+    })
+    added = STATE.add_flow(summary, findings)
+    return {"ok": True, "findings": len(findings), "new": added}
+
+
+@app.get("/findings")
+async def get_findings() -> dict[str, Any]:
+    findings = sorted(STATE.get_findings(), key=lambda f: detect.severity_rank(f["severity"]))
+    return {"count": len(findings), "findings": findings}
+
+
+@app.get("/scope")
+async def get_scope() -> dict[str, Any]:
+    return {"scope": STATE.get_scope()}
+
+
+@app.post("/scope")
+async def set_scope(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = payload.get("scope", [])
+    items = raw.split(",") if isinstance(raw, str) else list(raw)
+    STATE.set_scope(items)
+    return {"ok": True, "scope": STATE.get_scope()}
 
 
 @app.post("/app/{name}")

@@ -64,6 +64,7 @@
       <span class="pill" id="p-panes">panes …</span>
       <span class="pill" id="p-active">active …</span>
       <span class="pill" id="p-browser">browser …</span>
+      <span class="pill" id="p-find" title="auto-flagged findings — click to view">find …</span>
       <span class="pill" id="p-shot">shot …</span>
     </div>
   </header>
@@ -86,12 +87,37 @@
     </div>
     <div class="composer-row">
       <a id="ctxBtn">peek at injected context</a>
+      <span>·</span>
+      <label>scope: <input id="scope" placeholder="host filter (blank = all)"
+        style="background:var(--bg);color:var(--fg);border:1px solid var(--border);
+        border-radius:5px;padding:2px 6px;font:12px var(--mono);width:220px"></label>
       <span id="busy"></span>
     </div>
   </footer>
 
   <dialog id="ctxDialog"><pre id="ctxText"></pre><div style="margin-top:10px;text-align:right">
     <button onclick="document.getElementById('ctxDialog').close()">close</button></div></dialog>
+
+  <dialog id="findDialog" style="min-width:60vw">
+    <div id="findList"></div>
+    <div style="margin-top:10px;text-align:right">
+      <button onclick="document.getElementById('findDialog').close()">close</button></div>
+  </dialog>
+  <style>
+    .find { border-left: 3px solid var(--border); padding: 6px 10px; margin: 6px 0;
+      background: #0d1117; border-radius: 0 6px 6px 0; }
+    .find .h { font: 12px var(--mono); }
+    .find .ev { color: var(--muted); font: 11.5px var(--mono); word-break: break-all; }
+    .sev-high { border-left-color: var(--red); }
+    .sev-medium { border-left-color: #d29922; }
+    .sev-low { border-left-color: var(--accent); }
+    .sev-info { border-left-color: var(--muted); }
+    .badge { font: 10px var(--mono); padding: 1px 6px; border-radius: 8px; margin-right: 6px; }
+    .badge.high { background: #f8514933; color: var(--red); }
+    .badge.medium { background: #d2992233; color: #e3b341; }
+    .badge.low { background: #2f81f733; color: var(--accent); }
+    .badge.info { background: #21262d; color: var(--muted); }
+  </style>
 
 <script>
 const API = location.origin.startsWith("http") ? "" : "http://127.0.0.1:7331";
@@ -191,6 +217,8 @@ async function poll() {
     pill($("p-active"), null, "active <b>" + (s.active_pane || "—") + "</b>");
     pill($("p-browser"), s.browser_fresh, "browser <b>" +
       (s.browser_url ? new URL(s.browser_url).host : "—") + "</b>");
+    pill($("p-find"), s.findings_high > 0 ? false : (s.findings > 0 ? true : null),
+      "find <b>" + (s.findings || 0) + (s.findings_high ? " (" + s.findings_high + " hi)" : "") + "</b>");
     pill($("p-shot"),
       s.screenshot_pending ? true : (h.screenshot_working ? null : false),
       "shot <b>" + (s.screenshot_pending ? "pending"
@@ -211,6 +239,22 @@ $("input").addEventListener("input", (e) => {
   e.target.style.height = "auto";
   e.target.style.height = Math.min(e.target.scrollHeight, 180) + "px";
 });
+$("p-find").onclick = async () => {
+  const { findings } = await fetch(API + "/findings").then((r) => r.json());
+  if (!findings.length) {
+    $("findList").innerHTML = "<p style='color:var(--muted)'>No findings yet. Browse a "
+      + "target (with the extension and/or mitmproxy proxy) and they'll appear here.</p>";
+  } else {
+    $("findList").innerHTML = findings.map((f) =>
+      `<div class="find sev-${f.severity}">
+        <div class="h"><span class="badge ${f.severity}">${f.severity}</span>
+          <b>${escapeHtml(f.title)}</b> · ${escapeHtml(f.method)} ${escapeHtml(f.url)}</div>
+        <div class="ev">${escapeHtml(f.where)}: ${escapeHtml(f.evidence)}</div>
+      </div>`).join("");
+  }
+  $("findDialog").showModal();
+};
+
 $("ctxBtn").onclick = async () => {
   const c = await fetch(API + "/context").then((r) => r.json());
   $("ctxText").textContent =
@@ -218,6 +262,23 @@ $("ctxBtn").onclick = async () => {
   $("ctxDialog").showModal();
 };
 
+// scope control
+async function loadScope() {
+  try {
+    const { scope } = await fetch(API + "/scope").then((r) => r.json());
+    if (document.activeElement !== $("scope")) $("scope").value = (scope || []).join(", ");
+  } catch (_) {}
+}
+async function saveScope() {
+  await fetch(API + "/scope", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ scope: $("scope").value }),
+  });
+}
+$("scope").addEventListener("change", saveScope);
+$("scope").addEventListener("keydown", (e) => { if (e.key === "Enter") { saveScope(); $("scope").blur(); } });
+
+loadScope();
 poll();
 setInterval(poll, 2500);
 $("input").focus();

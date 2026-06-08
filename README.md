@@ -14,10 +14,12 @@ UI never touches it.
    collectors                     aggregator (FastAPI :7331)              UI
  ┌───────────────┐   POST /panes  ┌──────────────────────────┐   GET /context
  │ tmux_poll     │───────────────▶│  rolling state           │◀───────────────┐
- │ browser ext   │──POST /browser▶│  + token-budget trimmer  │                │
- │ tail (burp…)  │──POST /app/*  ▶│                          │   POST /chat   │
- │ screenshot    │  hotkey flag   │  /chat → provider ───────┼──stream──────▶ │
- └───────────────┘                └──────────────────────────┘   (index.html) │
+ │ browser ext   │─POST /browser ▶│  + token-budget trimmer  │                │
+ │ browser ext   │─POST /flow ───▶│  + detection engine ─────┼─findings──▶    │
+ │ mitmproxy     │─POST /flow ───▶│    (auto-flag findings)  │   POST /chat   │
+ │ tail (burp…)  │─POST /app/*  ─▶│  /chat → provider ───────┼──stream──────▶ │
+ │ screenshot    │  hotkey flag   │                          │   (index.html) │
+ └───────────────┘                └──────────────────────────┘                │
                                               ▲                                 │
                               ANTHROPIC_API_KEY / OPENAI_API_KEY                │
 ```
@@ -42,7 +44,9 @@ Without an API key the collectors and UI still run — only chat is disabled.
 | **aggregator** | FastAPI daemon: collects state, budgets context, proxies chat to Anthropic, serves the UI. | `python -m aggregator.main` |
 | **tmux_poll** | Dumps *every* pane across *all* sessions/windows every 2s. Stdlib only. | `python -m aggregator.tmux_poll` |
 | **tail** | Follows any log/command (Burp, tshark, nmap…) into the context. Stdlib only. | `python -m aggregator.tail burp --file /tmp/burp.log` |
-| **extension** | MV3 browser extension: page snapshots + fetch/XHR interception. | Load unpacked from `extension/` |
+| **detect** | Detection engine: scans flows, auto-flags findings. Shared by all feeds. | (library; see Web enumeration) |
+| **proxy addon** | mitmproxy addon: Burp-level full-traffic feed. | `mitmdump -s proxy/ctf_addon.py -p 8080` |
+| **extension** | MV3 browser extension: page snapshots + request/response **body** capture. | Load unpacked from `extension/` |
 | **ui** | Single-file chat UI with live status pills and streaming replies. | served at `http://127.0.0.1:7331/` |
 
 ## How context gets built
@@ -58,6 +62,51 @@ token-budgeted block, **newest/active data first**, stopping once the budget
 Stale browser/app data (older than `CTF_STALE_AFTER`, default 120s) is dropped so
 the model isn't shown a tab you closed. Click **"peek at injected context"** in
 the UI to see exactly what gets sent.
+
+## Web enumeration: traffic inspection + auto-flagging
+
+ctf-brain inspects HTTP traffic and **auto-flags** suspicious things, then feeds
+the findings to the assistant as top-priority context. Two feeds, one detection
+engine (`aggregator/detect.py`):
+
+| Feed | Setup | Sees |
+|---|---|---|
+| **Browser extension** | already loaded | request/response **bodies** of everything the page fetches (XHR/fetch), plus JS-readable headers |
+| **mitmproxy addon** (`proxy/ctf_addon.py`) | run a proxy (below) | **everything** — navigations, assets, TLS-decrypted, and JS-hidden headers (`Set-Cookie`, full CORS) |
+
+**What it flags** (severity-ranked): CTF flag patterns; leaked secrets (private
+keys, AWS/Google/Slack/GitHub tokens, JWTs, `password=…`); SQL errors and stack
+traces / debug pages (**injection & info-leak signals**); exposed endpoints
+(`.git`, `.env`, backups, admin panels, swagger/graphql, `phpinfo`); CORS
+wildcard-with-credentials and insecure cookies; internal IPs and tech-version
+disclosure.
+
+Findings show in the **`find N`** pill (red when high-severity) — click it for the
+list — and in the injected context, so you can ask *"what's the most promising
+lead here and how do I exploit it?"*
+
+### Target scope (do this first)
+
+Like Burp's scope. Set the **scope** field in the UI (or `CTF_SCOPE`, or
+`POST /scope`) to your target host(s) — comma-separated substrings, e.g.
+`target.htb, 10.10.10.5`. When set, only matching traffic is scanned, stored, and
+shown; your own browsing (Gmail, etc.) is dropped entirely. **Leave it blank and
+everything is in scope** — fine for a dedicated CTF browser profile, noisy if you
+browse normally. Setting scope is the single biggest noise reducer.
+
+### Turn on the mitmproxy proxy (full coverage)
+
+```bash
+pip install mitmproxy
+mitmdump -s proxy/ctf_addon.py --listen-host 127.0.0.1 --listen-port 8080
+```
+Point your browser's HTTP/HTTPS proxy at `127.0.0.1:8080`, then visit
+`http://mitm.it` once to install mitmproxy's CA cert. All decrypted traffic now
+flows through the detection engine. (Set `CTF_AGG_URL` if the aggregator isn't on
+the default port.) Findings from both feeds are deduped, so running both is fine.
+
+> Inspect only targets you're authorized to test — this captures full bodies,
+> cookies, and tokens.
 
 ## LLM providers
 
@@ -110,6 +159,7 @@ All via env vars (see `.env.example`). Highlights:
 | Var | Default | Notes |
 |---|---|---|
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | At least one required for chat. |
+| `CTF_SCOPE` | — | Comma-separated target host filters (Burp-style scope). Blank = all. |
 | `CTF_PROVIDER` | auto | `anthropic` or `openai`; auto-detected from keys. |
 | `CTF_MODEL` | per-provider | `claude-opus-4-8` (anthropic) / `gpt-4o` (openai). |
 | `OPENAI_BASE_URL` | — | Point the openai provider at any compatible endpoint. |
