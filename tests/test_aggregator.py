@@ -46,7 +46,13 @@ def reset_state():
     STATE.session = "default"
     STATE._counter = 0
     STATE._dirty = False
+    STATE._vuln_queried = set()
     STATE.last_pane_update = None
+    # Don't fire live NVD lookups or LLM parses from the pipeline during tests.
+    config.VULN_LOOKUP = False
+    config.AUTO_PARSE = False
+    import aggregator.main as _m
+    _m._pane_track.clear()
     yield
 
 
@@ -593,6 +599,107 @@ def test_artifacts_dedupe_across_calls(client):
     client.post("/flow", json={"url": "http://t/b", "method": "GET", "resp_body": md5})
     vals = [a["value"] for a in client.get("/artifacts").json()["artifacts"]]
     assert vals.count(md5) == 1
+
+
+# --- vulnerability intelligence --------------------------------------------
+_NVD_SAMPLE = {"vulnerabilities": [{"cve": {
+    "id": "CVE-2021-41773",
+    "descriptions": [{"lang": "en", "value": "Path traversal in Apache 2.4.49"}],
+    "metrics": {"cvssMetricV31": [{"cvssData": {"baseScore": 9.8, "baseSeverity": "CRITICAL"}}]},
+    "references": [{"url": "https://example/advisory"}],
+}}]}
+
+
+def test_vulndb_parses_nvd():
+    from aggregator import vulndb
+    cves = vulndb._parse_nvd(_NVD_SAMPLE)
+    assert cves[0]["id"] == "CVE-2021-41773"
+    assert cves[0]["cvss"] == 9.8 and cves[0]["severity"] == "CRITICAL"
+
+
+def test_vulndb_keyword_candidates_denoise():
+    from aggregator import vulndb
+    cands = vulndb._keyword_candidates("Apache httpd 2.4.49", "")
+    # raw banner kept, plus a denoised variant without 'httpd' that NVD can match
+    assert "Apache httpd 2.4.49" in cands
+    assert any("httpd" not in c and "2.4.49" in c and "Apache" in c for c in cands)
+
+
+def test_vulndb_lookup_flags_kev(monkeypatch):
+    from aggregator import vulndb
+
+    async def fake_nvd(product, version):
+        return vulndb._parse_nvd(_NVD_SAMPLE)
+    monkeypatch.setattr(vulndb, "nvd_lookup", fake_nvd)
+    monkeypatch.setattr(vulndb, "_kev_by_cve",
+                        {"CVE-2021-41773": {"requiredAction": "patch now",
+                                            "knownRansomwareCampaignUse": "Known"}})
+    res = _run(vulndb.lookup("Apache httpd", "2.4.49"))
+    assert res["kev_count"] == 1
+    c = res["cves"][0]
+    assert c["kev"] is True and c["ransomware"] is True and "patch" in c["exploit"]
+
+
+def test_vulns_endpoint(client, monkeypatch):
+    from aggregator import vulndb
+
+    async def fake_lookup(product, version=""):
+        return {"product": product, "version": version, "cves": [{"id": "CVE-1"}], "kev_count": 0}
+    monkeypatch.setattr(vulndb, "lookup", fake_lookup)
+    assert client.get("/vulns", params={"product": "nginx", "version": "1.18"}).json()["cves"][0]["id"] == "CVE-1"
+
+
+def test_engagement_surfaces_cve_and_exploit_step(client):
+    STATE.merge_hosts([{"host": "10.0.0.1", "ports": {
+        "80/tcp": {"port": "80", "proto": "tcp", "state": "open",
+                   "service": "http", "version": "Apache httpd 2.4.49"}}}])
+    STATE.set_port_vulns("10.0.0.1", "80/tcp", [
+        {"id": "CVE-2021-41773", "severity": "CRITICAL", "cvss": 9.8, "kev": True,
+         "summary": "Path traversal", "refs": ["https://x"]}])
+    e = client.get("/engagement").json()
+    assert e["assets"]["vulns"][0]["cve"] == "CVE-2021-41773"
+    assert any("CVE-2021-41773" in s["title"] for s in e["next_steps"])
+
+
+# --- LLM tool-output parsing -----------------------------------------------
+def test_llm_extract_json_handles_fences():
+    from aggregator import llm_extract
+    assert llm_extract._extract_json('```json\n{"a": 1}\n```')["a"] == 1
+    assert llm_extract._extract_json('noise {"b": 2} trailing')["b"] == 2
+    assert llm_extract._extract_json("not json") == {}
+
+
+def test_llm_extract_merges_into_kb():
+    from aggregator import llm_extract
+    counts = llm_extract.merge({"tool": "nmap", "hosts": [
+        {"host": "1.2.3.4", "ports": [{"port": "22", "proto": "tcp",
+                                       "service": "ssh", "version": "OpenSSH 9.1"}]}],
+        "credentials": ["user=root"], "notes": ["box looks like Linux"]})
+    assert counts["hosts"] == 1
+    assert any(p["service"] == "ssh" for h in STATE.get_hosts() for p in h["ports"])
+    assert any(a["value"] == "user=root" for a in STATE.get_artifacts())
+
+
+def test_parse_endpoint_uses_llm(client, monkeypatch):
+    async def fake_complete(self, system, user):
+        return '{"hosts": [{"host": "5.6.7.8", "ports": [{"port":"445","proto":"tcp","service":"smb","version":"Samba 4.1"}]}]}'
+    monkeypatch.setattr(providers.OpenAIProvider, "complete", fake_complete)
+    monkeypatch.setattr(providers.AnthropicProvider, "complete", fake_complete)
+    monkeypatch.setattr(providers.OpenAIProvider, "available", lambda self: True)
+    monkeypatch.setattr(providers.AnthropicProvider, "available", lambda self: True)
+    r = client.post("/parse", json={"text": "443/tcp open ... whatever tool output"}).json()
+    assert r["ok"] and r["merged"]["hosts"] == 1
+    assert any(h["host"] == "5.6.7.8" for h in client.get("/hosts").json()["hosts"])
+
+
+def test_tool_lookup_vulns(monkeypatch):
+    from aggregator import vulndb
+
+    async def fake_lookup(product, version=""):
+        return {"product": product, "version": version, "kev_count": 1,
+                "cves": [{"id": "CVE-9", "severity": "HIGH", "cvss": 8.1, "kev": True, "summary": "x"}]}
+    monkeypatch.setattr(vulndb, "lookup", fake_lookup)
+    assert "CVE-9" in _run(tools.run_tool("lookup_vulns", {"product": "vsftpd", "version": "2.3.4"}))
 
 
 def test_tool_get_engagement_and_add_note():

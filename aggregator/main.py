@@ -14,26 +14,82 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 import contextlib
+import time
 
 from . import (budget, config, decoders, detect, engagement, extract, llm,
-               methodology, providers, screenshot, tools)
+               methodology, providers, screenshot, tools, vulndb)
+
+_vuln_sem = asyncio.Semaphore(2)  # be gentle with the NVD rate limit
+
+
+async def _lookup_one(host: str, port_key: str, banner: str) -> None:
+    async with _vuln_sem:
+        res = await vulndb.lookup(banner)
+    STATE.set_port_vulns(host, port_key, res.get("cves", []))
+
+
+def schedule_vuln_lookups() -> None:
+    if not config.VULN_LOOKUP:
+        return
+    for host, port_key, banner in STATE.pending_vuln_lookups():
+        asyncio.ensure_future(_lookup_one(host, port_key, banner))
+
+
+# Per-pane debounce state for auto LLM-parsing: key -> {hash, since, parsed}.
+_pane_track: dict[str, dict[str, Any]] = {}
+
+
+async def _parse_and_merge(text: str) -> dict[str, Any]:
+    from . import llm_extract
+    data = await llm_extract.parse_output(text)
+    counts = llm_extract.merge(data)
+    schedule_vuln_lookups()  # new service versions → CVE lookups
+    return counts
+
+
+async def maybe_parse_pane(panes: dict[str, Any]) -> None:
+    """Auto LLM-parse a pane once its output has been stable for a few seconds."""
+    if not config.AUTO_PARSE or not llm.has_api_key():
+        return
+    import hashlib
+    now = time.time()
+    for key, p in panes.items():
+        content = p.get("content", "") or ""
+        if len(content) < 80 or "\n" not in content:
+            continue  # too small to be tool output
+        h = hashlib.md5(content.encode("utf-8", "replace")).hexdigest()
+        t = _pane_track.setdefault(key, {"hash": None, "since": now, "parsed": None})
+        if h != t["hash"]:
+            t["hash"], t["since"] = h, now
+            continue
+        if h != t["parsed"] and (now - t["since"]) >= config.PARSE_STABLE_SECONDS:
+            t["parsed"] = h
+            asyncio.ensure_future(_parse_and_merge(content))
 from .state import STATE
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load the configured engagement and autosave it periodically + on shutdown.
     STATE.load(config.SESSION)
+    vulndb.load_kev_from_disk()
 
     async def autosave():
         while True:
             await asyncio.sleep(15)
             await asyncio.to_thread(STATE.save)
 
-    task = asyncio.ensure_future(autosave())
+    async def kev_refresher():
+        while True:
+            with contextlib.suppress(Exception):
+                await vulndb.refresh_kev()
+            await asyncio.sleep(config.KEV_REFRESH_HOURS * 3600)
+
+    tasks = [asyncio.ensure_future(autosave()), asyncio.ensure_future(kev_refresher())]
     try:
         yield
     finally:
-        task.cancel()
+        for t in tasks:
+            t.cancel()
         with contextlib.suppress(Exception):
             await asyncio.to_thread(STATE.save, True)
 
@@ -97,6 +153,8 @@ async def recv_panes(payload: dict[str, Any]) -> dict[str, Any]:
         arts = extract.extract_artifacts(text, "tmux")
         STATE.add_artifacts(arts)
         STATE.add_findings(extract.artifacts_to_findings(arts))
+        schedule_vuln_lookups()           # version -> CVE for any new services
+        await maybe_parse_pane(panes)     # LLM-structure stabilized tool output
     return {"ok": True, "panes": len(panes)}
 
 
@@ -176,6 +234,32 @@ async def get_hosts() -> dict[str, Any]:
 @app.get("/artifacts")
 async def get_artifacts() -> dict[str, Any]:
     return {"artifacts": STATE.get_artifacts()}
+
+
+@app.get("/vulns")
+async def get_vulns(product: str, version: str = "") -> dict[str, Any]:
+    """On-demand version -> CVE lookup (NVD + KEV)."""
+    return await vulndb.lookup(product, version)
+
+
+@app.post("/vulndb/refresh")
+async def refresh_vulndb() -> dict[str, Any]:
+    await vulndb.refresh_kev(force=True)
+    return {"ok": True, **vulndb.stats()}
+
+
+@app.post("/parse")
+async def parse_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
+    """LLM-parse arbitrary tool output (given text, or the active pane) into the KB."""
+    text = payload.get("text")
+    if not text:
+        snap = STATE.snapshot()
+        text = next((p.get("content", "") for p in snap["panes"].values()
+                     if p.get("active")), "")
+    if not text:
+        return {"ok": False, "error": "no text and no active pane"}
+    counts = await _parse_and_merge(text)
+    return {"ok": True, "merged": counts}
 
 
 @app.get("/engagement")

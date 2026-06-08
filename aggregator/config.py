@@ -79,6 +79,20 @@ SCOPE: list[str] = [s.strip().lower() for s in os.environ.get("CTF_SCOPE", "").s
 DATA_DIR: str = os.path.expanduser(os.environ.get("CTF_DATA_DIR", "~/.ctf-brain/engagements"))
 SESSION: str = os.environ.get("CTF_SESSION", "default")
 
+# --- Vulnerability intelligence --------------------------------------------
+# Version -> CVE lookups via the live NVD API (cached to disk) + the CISA KEV
+# (known-exploited) catalog, refreshed periodically.
+VULN_DIR: str = os.path.join(DATA_DIR, "vulncache")
+NVD_API_KEY: str = os.environ.get("NVD_API_KEY", "")        # optional, higher rate limit
+KEV_REFRESH_HOURS: int = _int("CTF_KEV_REFRESH_HOURS", 12)
+NVD_CACHE_DAYS: int = _int("CTF_NVD_CACHE_DAYS", 7)
+VULN_LOOKUP: bool = os.environ.get("CTF_VULN_LOOKUP", "1") != "0"
+
+# --- LLM tool-output parsing -----------------------------------------------
+# Seconds a pane's output must be unchanged before we auto-parse it with the LLM.
+PARSE_STABLE_SECONDS: float = float(os.environ.get("CTF_PARSE_STABLE_SECONDS", "6"))
+AUTO_PARSE: bool = os.environ.get("CTF_AUTO_PARSE", "1") != "0"
+
 # --- Misc ------------------------------------------------------------------
 # Browser snapshots/app logs older than this (seconds) are treated as stale and
 # dropped from the context so the LLM isn't shown a page you closed an hour ago.

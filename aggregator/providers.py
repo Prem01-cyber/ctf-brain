@@ -100,6 +100,10 @@ class Provider:
         raise NotImplementedError
         yield ""
 
+    async def complete(self, system: str, user: str) -> str:  # pragma: no cover
+        """Single non-streaming completion (used for structured parsing)."""
+        raise NotImplementedError
+
 
 class AnthropicProvider(Provider):
     name = "anthropic"
@@ -171,6 +175,16 @@ class AnthropicProvider(Provider):
             yield f"\n[ctf-brain] anthropic API error {e.status_code}: {e.message}"
         except Exception as e:  # noqa: BLE001
             yield f"\n[ctf-brain] anthropic agent error: {e}"
+
+    async def complete(self, system, user):
+        import anthropic
+
+        client = anthropic.AsyncAnthropic()
+        resp = await client.messages.create(
+            model=config.MODEL, max_tokens=config.MAX_OUTPUT_TOKENS,
+            system=system, messages=[{"role": "user", "content": user}],
+            thinking={"type": "disabled"})
+        return "".join(b.text for b in resp.content if b.type == "text")
 
 
 class OpenAIProvider(Provider):
@@ -264,6 +278,16 @@ class OpenAIProvider(Provider):
             yield f"\n[ctf-brain] openai API error {e.status_code}: {e.message}"
         except Exception as e:  # noqa: BLE001
             yield f"\n[ctf-brain] openai agent error: {e}"
+
+    async def complete(self, system, user):
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(base_url=config.OPENAI_BASE_URL)
+        resp = await self._create(
+            client, model=config.MODEL,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}])
+        return resp.choices[0].message.content or ""
 
 
 _REGISTRY: dict[str, Provider] = {

@@ -47,6 +47,7 @@ class State:
         self.artifacts: list[dict[str, Any]] = []        # hashes/creds/emails, deduped
         self._artifact_keys: set[str] = set()
         self._last_pane_hash: str | None = None
+        self._vuln_queried: set[str] = set()   # service banners already looked up
         self._counter = 0
         self._dirty = False
 
@@ -175,6 +176,29 @@ class State:
     def get_artifacts(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self.artifacts)
+
+    def pending_vuln_lookups(self) -> list[tuple[str, str, str]]:
+        """Return (host, port_key, banner) for service versions not yet looked up,
+        marking them queried so we don't schedule duplicates."""
+        out = []
+        with self._lock:
+            for hkey, h in self.hosts.items():
+                for pk, p in h["ports"].items():
+                    banner = (p.get("version") or "").strip()
+                    if not banner or "vulns" in p:
+                        continue
+                    if banner.lower() in self._vuln_queried:
+                        continue
+                    self._vuln_queried.add(banner.lower())
+                    out.append((hkey, pk, banner))
+        return out
+
+    def set_port_vulns(self, host: str, port_key: str, cves: list[dict[str, Any]]) -> None:
+        with self._lock:
+            p = self.hosts.get(host, {}).get("ports", {}).get(port_key)
+            if p is not None:
+                p["vulns"] = cves
+                self._dirty = True
 
     def update_inventory(self, flow: dict[str, Any]) -> None:
         url = flow.get("url", "")
@@ -423,6 +447,7 @@ class State:
             self.flows.clear()
             self.hosts, self.artifacts, self._artifact_keys = {}, [], set()
             self._last_pane_hash = None
+            self._vuln_queried = set()
             self.notes, self.tasks, self.flags = [], [], []
             self.scope, self._counter = [], 0
             self.session = name

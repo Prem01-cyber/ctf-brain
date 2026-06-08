@@ -45,6 +45,19 @@ def _assets(snapshot: dict[str, Any]) -> dict[str, Any]:
     if not ports:
         ports = _parse_ports(_panes_text(snapshot))
 
+    # CVEs attached to discovered service versions (KEV-first).
+    vulns = []
+    for h in kb_hosts:
+        for p in h.get("ports", []):
+            for c in p.get("vulns", []) or []:
+                vulns.append({"host": h.get("host"), "port": p.get("port"),
+                              "service": p.get("service"), "version": p.get("version"),
+                              "cve": c.get("id"), "severity": c.get("severity"),
+                              "cvss": c.get("cvss"), "kev": c.get("kev"),
+                              "summary": c.get("summary"), "exploit": c.get("exploit", ""),
+                              "refs": c.get("refs", [])})
+    vulns.sort(key=lambda v: (not v.get("kev"), -(v.get("cvss") or 0)))
+
     hosts = {h.get("host") for h in kb_hosts if h.get("host") and h["host"] != "unknown"}
     hosts |= {e.get("host") for e in inv.get("endpoints", []) if e.get("host")}
     if (snapshot.get("browser") or {}).get("url"):
@@ -62,6 +75,7 @@ def _assets(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "hosts": sorted(h for h in hosts if h),
         "open_ports": ports,
+        "vulns": vulns[:30],
         "services": sorted({p.get("service", "") for p in ports if p.get("service")}),
         "endpoints": len(inv.get("endpoints", [])),
         "params": inv.get("params", []),
@@ -103,6 +117,12 @@ def _next_steps(assets: dict[str, Any], findings: list[dict]) -> list[dict[str, 
         steps.append({"priority": prio, "title": title, "why": why,
                       "command": command, "phase": phase})
 
+    for v in assets.get("vulns", [])[:5]:
+        tag = "KEV/exploited-in-wild" if v.get("kev") else (v.get("severity") or "")
+        add(0, f"Exploit {v.get('service') or v.get('version')} — {v['cve']}",
+            f"{tag} (cvss {v.get('cvss')}) on {v.get('host')}:{v.get('port')}; "
+            f"{(v.get('summary') or '')[:120]}",
+            f"searchsploit {v['cve']}  # {(v.get('refs') or [''])[0]}", "Exploitation")
     if not assets["open_ports"] and assets["hosts"]:
         add(1, "Port scan the host", "no open ports recorded yet",
             f"nmap -sCV -p- -oA scan {host}", "Scanning")

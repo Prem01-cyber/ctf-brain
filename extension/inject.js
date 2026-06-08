@@ -11,11 +11,10 @@
 
   const MAX_BODY = 65536; // cap body capture to keep messaging light
   const TEXTY = /(json|text|html|xml|javascript|x-www-form-urlencoded|csv|graphql)/i;
-  // Only forward these response headers (Set-Cookie etc. aren't JS-readable here;
-  // use the mitmproxy addon for full header coverage).
-  const HDRS = ["content-type", "server", "x-powered-by", "x-aspnet-version",
-                "x-generator", "x-runtime", "access-control-allow-origin",
-                "access-control-allow-credentials"];
+  // Only CORS-safelisted response headers are readable from page JS; attempting
+  // others (Server, X-Powered-By, CORS, Set-Cookie…) just logs "Refused to get
+  // unsafe header". For full header coverage use the mitmproxy addon.
+  const HDRS = ["content-type"];
 
   function clip(s) {
     return typeof s === "string" ? s.slice(0, MAX_BODY) : undefined;

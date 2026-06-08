@@ -47,7 +47,8 @@ Without an API key the collectors and UI still run — only chat is disabled.
 | **detect** | Detection engine: scans flows, auto-flags findings (incl. JWT decode). | (library; see Web enumeration) |
 | **decoders / tools** | JWT + magic decoders; agent tool layer (findings/inventory/decode/replay/run). | (library; see Assistant tools) |
 | **inventory / methodology** | Recon site-map + param mining; phase playbook. | `GET /inventory`, `GET /methodology` |
-| **extract** | Auto-extraction: parse nmap → hosts/ports; pull hashes/creds/emails from any text. | (pipeline; see Cockpit) |
+| **extract / llm_extract** | Auto-extraction: LLM-parse any tool output → hosts/ports/services; regex for hashes/creds. | `POST /parse` |
+| **vulndb** | Version → CVE via live NVD (cached) + CISA KEV (exploited-in-wild). | `GET /vulns`, `POST /vulndb/refresh` |
 | **engagement / sessions** | Dynamic phase + next-steps; per-session hosts/artifacts/notes/tasks/flags, persisted. | `GET /engagement`, `/hosts`, `/artifacts`, `/sessions` |
 | **proxy addon** | mitmproxy addon: Burp-level full-traffic feed. | `mitmdump -s proxy/ctf_addon.py -p 8080` |
 | **extension** | MV3 browser extension: page snapshots + request/response **body** capture. | Load unpacked from `extension/` |
@@ -147,19 +148,38 @@ enumeration → exploitation → post-exploitation) and names the current phase.
 
 ### Automatic extraction pipeline
 
-Everything you do is mined into an accumulating, persisted **knowledge base**
-([extract.py](aggregator/extract.py)) — no manual entry:
+Everything you do is mined into an accumulating, persisted **knowledge base** — no
+manual entry:
 
-- **nmap in a tmux pane** → parsed into structured **hosts → ports → service →
-  version → OS** the moment the output appears (deduped, accumulates across scans).
-- **Opening a page / any HTTP body / terminal text** → scanned for **artifacts
-  that shouldn't be lying around**: password hashes (bcrypt/sha-crypt/argon2 +
-  bare MD5/SHA1/SHA256/SHA512/NTLM), credentials (`user=`/`password:`…), and
-  emails — auto-extracted, deduped, surfaced as both **artifacts** (knowledge
-  base) and **findings** (alerts).
+- **LLM-parsed tool output** ([llm_extract.py](aggregator/llm_extract.py)) — tool
+  output isn't standardized, so instead of brittle regex we hand a pane's output
+  to the model and get back structured **hosts → ports → service → version**,
+  endpoints, creds, and notes. Works for *any* tool (nmap, gobuster, nikto,
+  enum4linux…). Triggers automatically when a pane's output **stabilizes** (a few
+  seconds unchanged) and on-demand via the **parse pane** button / agent tool.
+  (A fast regex nmap parser in [extract.py](aggregator/extract.py) runs too as a
+  zero-cost first pass.)
+- **Artifacts from any text** — password hashes (bcrypt/sha-crypt/argon2 + bare
+  MD5/SHA1/256/512/NTLM), credentials, emails — extracted, deduped, surfaced as
+  both **artifacts** (knowledge base) and **findings** (alerts). (These *are*
+  fixed formats, so regex is reliable and free here.)
 
-Those feed the dashboard and the next-steps engine (e.g. a captured bcrypt →
-"Crack the captured bcrypt hash"; an open mysql port → "Enumerate mysql").
+### Vulnerability intelligence (version → CVE → exploit)
+
+When a service version is discovered, ctf-brain looks up known CVEs automatically
+([vulndb.py](aggregator/vulndb.py)) — the step that usually eats a pentester's time:
+
+- **Live NVD** queried by product+version (with keyword normalization, since a
+  raw banner like `Apache httpd 2.4.49` doesn't match NVD as-is), **cached to disk**.
+- **CISA KEV** catalog downloaded in full (~1.5 MB) and auto-refreshed; any CVE in
+  it is **confirmed exploited-in-the-wild** (⚠ flagged) with remediation guidance.
+
+Results attach to the service in the dashboard (CVE chips under each port, KEV in
+red) and become top **next steps** (e.g. `Apache httpd 2.4.49` →
+*"Exploit http — CVE-2021-41773"* with a `searchsploit` command). Precise and
+always current — no multi-GB local mirror. On-demand via `GET /vulns?product=&version=`
+or the agent's `lookup_vulns` tool. Set `NVD_API_KEY` for a higher rate limit;
+`CTF_VULN_LOOKUP=0` disables auto-lookups.
 
 ### The dashboard
 

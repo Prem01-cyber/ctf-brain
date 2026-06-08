@@ -40,6 +40,9 @@
   #d-steps .p0 { border-left-color: var(--red); } #d-steps .p1 { border-left-color: #d29922; } #d-steps .p2, #d-steps .p3 { border-left-color: var(--accent); }
   .assets { font: 12px var(--mono); display: flex; flex-direction: column; gap: 3px; }
   .assets b { color: var(--muted); font-weight: 600; }
+  #d-hosts .cves { margin: 2px 0 4px 12px; display: flex; flex-wrap: wrap; gap: 4px; }
+  .cve { font: 10px var(--mono); padding: 1px 5px; border-radius: 8px; background: #21262d; color: var(--accent); }
+  .cve.kev { background: #f8514922; color: var(--red); border: 1px solid #f8514955; }
   #d-flags .flag { font: 12px var(--mono); color: var(--green); word-break: break-all; }
   #d-tasks .task, #d-notes .note { font-size: 12.5px; padding: 3px 0; display: flex; gap: 6px; align-items: flex-start; }
   #d-tasks .task input { margin-top: 2px; } #d-tasks .task.done span { text-decoration: line-through; color: var(--muted); }
@@ -155,6 +158,7 @@
     </div>
     <div class="composer-row">
       <a id="nextBtn">⏭ next steps</a><span>·</span>
+      <a id="parseBtn" title="LLM-parse the active pane's output into the knowledge base">parse pane</a><span>·</span>
       <a id="decodeBtn">decode</a><span>·</span>
       <a id="repeaterBtn">repeater</a><span>·</span>
       <a id="invBtn">inventory</a><span>·</span>
@@ -356,6 +360,16 @@ $("nextBtn").onclick = () => {
     + "2-3 highest-value next steps? Give exact commands.";
   send();
 };
+$("parseBtn").onclick = async () => {
+  $("busy").textContent = "parsing pane…";
+  try {
+    const r = await fetch(API + "/parse", { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: "{}" }).then((r) => r.json());
+    $("busy").textContent = r.ok ? `parsed (+${r.merged.hosts || 0} hosts)` : ("parse: " + (r.error || "failed"));
+    pollEngagement();
+  } catch (e) { $("busy").textContent = "parse failed"; }
+  setTimeout(() => { $("busy").textContent = ""; }, 4000);
+};
 
 // Decode dialog
 $("decodeBtn").onclick = () => { $("decOut").textContent = ""; $("decodeDialog").showModal(); $("decIn").focus(); };
@@ -486,7 +500,12 @@ function renderDash(e) {
   $("d-hosts").innerHTML =
     (a.hosts && a.hosts.length ? `<div><b>hosts:</b> ${escapeHtml(a.hosts.join(", "))}</div>` : "") +
     (ports.length
-      ? ports.map((p) => `<div>${p.port}/${p.proto || "tcp"} <b>${escapeHtml(p.service || "?")}</b> ${escapeHtml(p.version || "")}</div>`).join("")
+      ? ports.map((p) => {
+          const cves = (p.vulns || []).map((c) =>
+            `<span class="cve ${c.kev ? "kev" : ""}" title="${escapeHtml(c.summary || "")}">${escapeHtml(c.id)}${c.kev ? " ⚠" : ""}</span>`).join(" ");
+          return `<div>${p.port}/${p.proto || "tcp"} <b>${escapeHtml(p.service || "?")}</b> ${escapeHtml(p.version || "")}`
+            + (cves ? `<div class="cves">${cves}</div>` : "") + `</div>`;
+        }).join("")
       : "<span class='muted'>no scan yet — run nmap in a pane</span>");
 
   // Artifacts (hashes / creds / emails)

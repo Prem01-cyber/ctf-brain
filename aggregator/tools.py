@@ -63,6 +63,16 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "record_flag",
      "description": "Record a captured flag for this session.",
      "properties": {"flag": {"type": "string"}}, "required": ["flag"]},
+    {"name": "lookup_vulns",
+     "description": "Look up known CVEs for a software product + version (live NVD "
+                    "+ CISA known-exploited catalog). Use on discovered service versions.",
+     "properties": {"product": {"type": "string", "description": "e.g. 'Apache httpd' or 'OpenSSH'"},
+                    "version": {"type": "string"}},
+     "required": ["product"]},
+    {"name": "parse_output",
+     "description": "LLM-parse raw tool output (nmap/gobuster/etc.) into the knowledge "
+                    "base (hosts/ports/services/creds). Pass the text to structure.",
+     "properties": {"text": {"type": "string"}}, "required": ["text"]},
     {"name": "run_command",
      "description": "Run a shell command in a tmux pane and return its output. Use for "
                     "scans/enumeration (nmap, ffuf, curl). Requires the operator to have "
@@ -169,6 +179,22 @@ async def run_tool(name: str, args: dict[str, Any], allow_exec: bool = False) ->
 
         if name == "record_flag":
             return "flag recorded" if STATE.add_flag(args.get("flag", "")) else "already recorded"
+
+        if name == "lookup_vulns":
+            from . import vulndb
+            res = await vulndb.lookup(args.get("product", ""), args.get("version", ""))
+            return json.dumps({"product": res["product"], "version": res["version"],
+                               "kev_count": res["kev_count"],
+                               "cves": [{"id": c["id"], "severity": c["severity"],
+                                         "cvss": c["cvss"], "kev": c.get("kev"),
+                                         "summary": (c.get("summary") or "")[:160]}
+                                        for c in res["cves"]]})[:7000]
+
+        if name == "parse_output":
+            from . import llm_extract
+            data = await llm_extract.parse_output(args.get("text", ""))
+            counts = llm_extract.merge(data)
+            return json.dumps({"merged": counts, "parsed": data})[:6000]
 
         if name == "run_command":
             if not allow_exec:
