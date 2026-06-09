@@ -150,6 +150,31 @@ enumeration → exploitation → post-exploitation) and names the current phase.
 
 ## Cockpit: dynamic engagement tracking (the dashboard)
 
+### Dynamic strategist — "what we have / what it affords / what's next"
+
+A living assessment ([planner.py](aggregator/planner.py)) reasons over the *entire*
+knowledge base — hosts, ports, **versions → CVEs**, findings, artifacts,
+endpoints, flags, notes — and derives, for each discovered asset, **what it
+affords** (what can be extracted/exploited from it) plus the highest-value next
+moves with exact commands. It re-runs automatically whenever the state materially
+changes (a new service, an attached CVE, a new finding), debounced. This drives
+the dashboard's **Assessment** card and **Next steps** (the static rule-based
+steps are only a fallback when offline / no key). Nothing is hardcoded — e.g. an
+nmap hit of `Apache httpd 2.4.49` becomes *"vulnerable to CVE-2021-41773/42013 →
+path traversal → RCE"* with the real exploit command, on its own. On-demand via
+`POST /assess`; tune with `CTF_AUTO_ASSESS=0` / `CTF_REASSESS_INTERVAL`.
+
+### Autonomous web triage
+
+When you **open a page** (in scope), the tool-using agent investigates it on its
+own — the same ReAct loop, headless: it reads the captured request/response,
+decodes suspicious blobs, fetches linked source if useful, and checks what a web
+pentester checks (secrets, encoded data, params, comments, version/tech leaks,
+auth/cookies, errors). It records what it finds via `record_finding` / `add_task`
+/ `record_flag`, so results land in the **Signals** panel and tasks without you
+asking. Runs once per page (deduped), scope-gated. Toggle with `CTF_AUTO_AGENT=0`
+(falls back to a cheap single-pass analysis); it costs several LLM calls per page.
+
 ### Dynamic analysis — observe → search → claim
 
 The intelligence is **not a hardcoded ruleset**. When a tmux pane settles or you

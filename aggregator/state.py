@@ -48,6 +48,9 @@ class State:
         self._artifact_keys: set[str] = set()
         self._last_pane_hash: str | None = None
         self._vuln_queried: set[str] = set()   # service banners already looked up
+        # Dynamic LLM strategist assessment (what we have / affords / next gains).
+        self.assessment: dict[str, Any] = {}
+        self._assessment_sig: str = ""
         self._counter = 0
         self._dirty = False
 
@@ -177,6 +180,33 @@ class State:
         with self._lock:
             return list(self.artifacts)
 
+    def state_signature(self) -> str:
+        """Cheap hash of the material state — changes when there's something new to
+        reassess (hosts/ports/versions, CVEs, finding/flag counts)."""
+        import hashlib
+        with self._lock:
+            parts = []
+            for h, e in sorted(self.hosts.items()):
+                for pk, p in sorted(e["ports"].items()):
+                    parts.append(f"{h}{pk}{p.get('version', '')}{len(p.get('vulns', []) or [])}")
+            parts.append(f"f{len(self.findings)}a{len(self.artifacts)}"
+                         f"e{len(self.endpoints)}fl{len(self.flags)}")
+            return hashlib.md5("|".join(parts).encode()).hexdigest()
+
+    def set_assessment(self, assessment: dict[str, Any], sig: str) -> None:
+        with self._lock:
+            self.assessment = assessment or {}
+            self._assessment_sig = sig
+            self._dirty = True
+
+    def get_assessment(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self.assessment)
+
+    def assessment_stale(self, sig: str) -> bool:
+        with self._lock:
+            return sig != self._assessment_sig
+
     def pending_vuln_lookups(self) -> list[tuple[str, str, str]]:
         """Return (host, port_key, banner) for service versions not yet looked up,
         marking them queried so we don't schedule duplicates."""
@@ -284,6 +314,7 @@ class State:
                      "ports": sorted(h["ports"].values(), key=lambda p: int(p["port"]))}
                     for h in self.hosts.values()],
                 "artifacts": list(self.artifacts),
+                "assessment": dict(self.assessment),
                 "notes": list(self.notes),
                 "tasks": list(self.tasks),
                 "flags": list(self.flags),
@@ -379,6 +410,7 @@ class State:
             "notes": list(self.notes),
             "tasks": list(self.tasks),
             "flags": list(self.flags),
+            "assessment": self.assessment,
             "counter": self._counter,
         }
 
@@ -407,6 +439,7 @@ class State:
         self.notes = d.get("notes", [])
         self.tasks = d.get("tasks", [])
         self.flags = d.get("flags", [])
+        self.assessment = d.get("assessment", {})
         self._counter = d.get("counter", 0)
 
     def _path(self, name: str) -> str:
@@ -449,6 +482,7 @@ class State:
             self._last_pane_hash = None
             self._vuln_queried = set()
             self.notes, self.tasks, self.flags = [], [], []
+            self.assessment, self._assessment_sig = {}, ""
             self.scope, self._counter = [], 0
             self.session = name
             self._dirty = False

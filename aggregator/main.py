@@ -41,6 +41,7 @@ async def _lookup_one(host: str, port_key: str, banner: str) -> None:
     async with _vuln_sem:
         res = await vulndb.lookup(banner)
     STATE.set_port_vulns(host, port_key, res.get("cves", []))
+    maybe_reassess()  # CVEs attached → rethink what they afford
 
 
 def schedule_vuln_lookups() -> None:
@@ -48,6 +49,33 @@ def schedule_vuln_lookups() -> None:
         return
     for host, port_key, banner in STATE.pending_vuln_lookups():
         _bg(_lookup_one(host, port_key, banner))
+
+
+_last_reassess = 0.0
+
+
+async def _reassess() -> None:
+    from . import planner
+    sig = STATE.state_signature()
+    snap = STATE.snapshot()
+    assessment = await planner.assess(snap)
+    if assessment:
+        STATE.set_assessment(assessment, sig)
+
+
+def maybe_reassess() -> None:
+    """Re-run the dynamic strategist when the state materially changed (debounced).
+    This keeps a living 'what we have / what it affords / what's next' picture."""
+    global _last_reassess
+    if not config.AUTO_ASSESS or not llm.has_api_key():
+        return
+    now = time.time()
+    if not STATE.assessment_stale(STATE.state_signature()):
+        return
+    if now - _last_reassess < config.REASSESS_INTERVAL:
+        return
+    _last_reassess = now
+    _bg(_reassess())
 
 
 # Per-pane debounce state for auto LLM-parsing: key -> {hash, since, parsed}.
@@ -65,10 +93,30 @@ async def _parse_and_merge(text: str, source: str = "tool-output") -> dict[str, 
     return counts
 
 
+async def _investigate_page(page_text: str) -> None:
+    """Run the tool-using ReAct agent autonomously over a page: fetch source/requests,
+    decode suspicious data, and record findings/tasks itself."""
+    provider = providers.get_provider()
+    if not provider.available():
+        provider = next((p for p in providers._REGISTRY.values() if p.available()), None)
+        if provider is None:
+            return
+    ctx = budget.build_context(STATE.snapshot())["rendered"]
+    system = llm.build_autonomous_prompt(ctx)
+    msgs = [{"role": "user", "content": page_text}]
+    chunks: list[str] = []
+    async for c in provider.stream_agent(msgs, system, None, allow_exec=False):
+        chunks.append(c)
+    schedule_vuln_lookups()
+    summary = "".join(chunks).strip()
+    if summary:
+        STATE.add_note(f"[auto-triage] {summary[-600:]}")
+
+
 async def maybe_analyze_browser(payload: dict[str, Any]) -> None:
-    """Dynamically analyze an opened page once (deduped by url+content) — the model
-    decides if anything on it is abnormal/interesting and worth progressing."""
-    if not config.AUTO_PARSE or not llm.has_api_key():
+    """When a page opens (once per page), autonomously investigate it with tools —
+    or, if the agent is disabled, do a single-pass anomaly analysis."""
+    if not llm.has_api_key():
         return
     import hashlib
     body = (payload.get("bodyText") or "")
@@ -82,7 +130,10 @@ async def maybe_analyze_browser(payload: dict[str, Any]) -> None:
     if len(_analyzed_hashes) > 500:
         _analyzed_hashes.clear()
     text = f"URL: {url}\nTITLE: {payload.get('title', '')}\n\n{body}"
-    _bg(_parse_and_merge(text, "web-page"))
+    if config.AUTO_AGENT:
+        _bg(_investigate_page(text))
+    elif config.AUTO_PARSE:
+        _bg(_parse_and_merge(text, "web-page"))
 
 
 async def maybe_parse_pane(panes: dict[str, Any]) -> None:
@@ -193,6 +244,7 @@ async def recv_panes(payload: dict[str, Any]) -> dict[str, Any]:
         STATE.add_findings(extract.artifacts_to_findings(arts))
         schedule_vuln_lookups()           # version -> CVE for any new services
         await maybe_parse_pane(panes)     # LLM-structure stabilized tool output
+        maybe_reassess()                  # rethink the whole picture
     return {"ok": True, "panes": len(panes)}
 
 
@@ -247,6 +299,7 @@ async def recv_flow(payload: dict[str, Any]) -> dict[str, Any]:
     })
     STATE.update_inventory(payload)
     added = STATE.add_flow(summary, findings)
+    maybe_reassess()
     return {"ok": True, "findings": len(findings), "new": added}
 
 
@@ -300,6 +353,13 @@ async def parse_endpoint(payload: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": "no text and no active pane"}
     counts = await _parse_and_merge(text)
     return {"ok": True, "merged": counts}
+
+
+@app.post("/assess")
+async def reassess_now() -> dict[str, Any]:
+    """Force a strategist reassessment of the whole engagement state."""
+    await _reassess()
+    return {"ok": True, "assessment": STATE.get_assessment()}
 
 
 @app.get("/engagement")

@@ -92,6 +92,12 @@ VULN_LOOKUP: bool = os.environ.get("CTF_VULN_LOOKUP", "1") != "0"
 # Seconds a pane's output must be unchanged before we auto-parse it with the LLM.
 PARSE_STABLE_SECONDS: float = float(os.environ.get("CTF_PARSE_STABLE_SECONDS", "6"))
 AUTO_PARSE: bool = os.environ.get("CTF_AUTO_PARSE", "1") != "0"
+# Autonomously run the tool-using ReAct agent on each opened page (fetch source,
+# decode, check what pentesters check, record findings). More LLM calls per page.
+AUTO_AGENT: bool = os.environ.get("CTF_AUTO_AGENT", "1") != "0"
+# Dynamic strategist: re-derive "what we have / affords / next" when state changes.
+AUTO_ASSESS: bool = os.environ.get("CTF_AUTO_ASSESS", "1") != "0"
+REASSESS_INTERVAL: float = float(os.environ.get("CTF_REASSESS_INTERVAL", "20"))
 
 # --- Misc ------------------------------------------------------------------
 # Browser snapshots/app logs older than this (seconds) are treated as stale and

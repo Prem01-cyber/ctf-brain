@@ -58,6 +58,30 @@ def build_system_prompt(rendered_context: str) -> str:
         methodology=methodology.system_block(), context=rendered_context)
 
 
+_AUTONOMOUS = """
+===== AUTONOMOUS WEB TRIAGE =====
+You are autonomously triaging a web page the operator just opened. No human will \
+reply — investigate with your tools and RECORD your conclusions yourself.
+
+Check what a web pentester checks: leaked secrets/keys/tokens; encoded or \
+encrypted data (decode it with the decode tool); interesting endpoints and \
+parameters; HTML/JS comments; hidden form fields; version/tech disclosure; verbose \
+errors/stack traces; auth, cookie and session weaknesses; client-side logic that \
+hints at a mechanism (an encryption form, a key field, an admin area); and \
+anything out of place. Use get_flow to read the captured request/response, \
+http_request to fetch the raw source or linked resources (robots.txt, JS bundles) \
+— stay on this target — and decode on any suspicious blob.
+
+For each notable thing, call record_finding (with a severity) and add_task with the \
+concrete next step; record_flag for any flag. Work the ReAct loop (reason → one \
+tool → observe → reason). Be concise; finish with a one-paragraph summary. Do not \
+ask questions."""
+
+
+def build_autonomous_prompt(rendered_context: str) -> str:
+    return build_system_prompt(rendered_context) + _AUTONOMOUS
+
+
 def has_api_key() -> bool:
     """True if *any* configured provider has credentials."""
     return providers.has_any_key()

@@ -65,6 +65,13 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "record_flag",
      "description": "Record a captured flag for this session.",
      "properties": {"flag": {"type": "string"}}, "required": ["flag"]},
+    {"name": "record_finding",
+     "description": "Record a confirmed security finding/observation (shows in the "
+                    "Signals panel). Use while investigating to persist what you found.",
+     "properties": {"title": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["high", "medium", "low", "info"]},
+                    "detail": {"type": "string"}},
+     "required": ["title"]},
     {"name": "read_file",
      "description": "Read a local file (e.g. /etc/hosts, a config, source, loot, scan "
                     "output) to understand the real environment. Read-only; use this "
@@ -195,6 +202,16 @@ async def run_tool(name: str, args: dict[str, Any], allow_exec: bool = False) ->
 
         if name == "record_flag":
             return "flag recorded" if STATE.add_flag(args.get("flag", "")) else "already recorded"
+
+        if name == "record_finding":
+            sev = args.get("severity", "medium")
+            sev = sev if sev in ("high", "medium", "low", "info") else "medium"
+            title = str(args.get("title", ""))[:200]
+            STATE.add_findings([{
+                "severity": sev, "category": "analysis", "rule": "agent", "title": title,
+                "evidence": str(args.get("detail", ""))[:280], "where": "agent",
+                "url": "", "method": "", "source": "agent", "key": f"agent|{title[:80]}"}])
+            return "finding recorded"
 
         if name == "read_file":
             path = os.path.expanduser(args.get("path", ""))

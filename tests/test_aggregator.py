@@ -47,6 +47,8 @@ def reset_state():
     STATE._counter = 0
     STATE._dirty = False
     STATE._vuln_queried = set()
+    STATE.assessment = {}
+    STATE._assessment_sig = ""
     STATE.last_pane_update = None
     # Don't fire live NVD lookups or LLM parses from the pipeline during tests.
     config.VULN_LOOKUP = False
@@ -727,6 +729,76 @@ def test_tool_lookup_vulns(monkeypatch):
                 "cves": [{"id": "CVE-9", "severity": "HIGH", "cvss": 8.1, "kev": True, "summary": "x"}]}
     monkeypatch.setattr(vulndb, "lookup", fake_lookup)
     assert "CVE-9" in _run(tools.run_tool("lookup_vulns", {"product": "vsftpd", "version": "2.3.4"}))
+
+
+def test_tool_record_finding_shows_in_signals():
+    out = _run(tools.run_tool("record_finding",
+                              {"title": "XOR cipher on /messages", "severity": "high",
+                               "detail": "hex + key field"}))
+    assert "recorded" in out
+    fs = STATE.get_findings()
+    assert any(f["rule"] == "agent" and f["severity"] == "high"
+               and "XOR" in f["title"] for f in fs)
+
+
+def test_browser_dispatches_autonomous_agent(monkeypatch):
+    import aggregator.main as m
+    captured = {}
+
+    def fake_bg(coro):
+        captured["name"] = coro.cr_code.co_name
+        coro.close()
+
+    monkeypatch.setattr(m, "_bg", fake_bg)
+    monkeypatch.setattr(m.llm, "has_api_key", lambda: True)
+    monkeypatch.setattr(m.config, "AUTO_AGENT", True)
+    m._analyzed_hashes.clear()
+    _run(m.maybe_analyze_browser({"url": "http://t/", "title": "x", "bodyText": "a" * 200}))
+    assert captured["name"] == "_investigate_page"
+
+    # With the agent disabled, fall back to the single-pass analysis.
+    captured.clear()
+    m._analyzed_hashes.clear()
+    monkeypatch.setattr(m.config, "AUTO_AGENT", False)
+    monkeypatch.setattr(m.config, "AUTO_PARSE", True)
+    _run(m.maybe_analyze_browser({"url": "http://t2/", "title": "x", "bodyText": "b" * 200}))
+    assert captured["name"] == "_parse_and_merge"
+
+
+# --- dynamic strategist / assessment ---------------------------------------
+def test_dynamic_assessment_drives_next_steps():
+    from aggregator import engagement
+    snap = {"hosts": [], "findings": [], "inventory": {},
+            "assessment": {"summary": "foothold via Apache RCE",
+                           "assets": [{"name": "443/https", "gives": "vhost + RCE",
+                                       "opportunities": ["exploit CVE-2021-41773"]}],
+                           "next_steps": [{"title": "Exploit path traversal", "priority": 0,
+                                           "command": "curl --path-as-is ..."}]}}
+    e = engagement.derive(snap)
+    assert e["assessment"]["dynamic"] is True
+    assert e["next_steps"][0]["title"] == "Exploit path traversal"
+    assert "foothold" in e["assessment"]["summary"]
+
+
+def test_state_signature_changes_with_new_host():
+    sig0 = STATE.state_signature()
+    STATE.merge_hosts([{"host": "1.1.1.1", "ports": {
+        "80/tcp": {"port": "80", "proto": "tcp", "service": "http", "version": "nginx 1.0"}}}])
+    assert STATE.state_signature() != sig0
+    assert STATE.assessment_stale(STATE.state_signature()) is True
+
+
+def test_assess_endpoint_runs_strategist(client, monkeypatch):
+    from aggregator import planner
+
+    async def fake_assess(snapshot):
+        return {"summary": "two web ports, one likely RCE",
+                "next_steps": [{"title": "pop a shell", "priority": 0}]}
+    monkeypatch.setattr(planner, "assess", fake_assess)
+    r = client.post("/assess").json()
+    assert r["ok"] and r["assessment"]["summary"].startswith("two web ports")
+    # and it now drives the engagement next steps
+    assert client.get("/engagement").json()["next_steps"][0]["title"] == "pop a shell"
 
 
 def test_tool_get_engagement_and_add_note():

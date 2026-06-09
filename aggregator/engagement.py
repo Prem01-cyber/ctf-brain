@@ -191,12 +191,22 @@ def derive(snapshot: dict[str, Any]) -> dict[str, Any]:
     sev = {"high": 0, "medium": 0, "low": 0, "info": 0}
     for f in findings:
         sev[f.get("severity", "info")] = sev.get(f.get("severity", "info"), 0) + 1
+
+    # Prefer the dynamic strategist's next steps; fall back to rules when there's
+    # no assessment yet (offline / no key).
+    assessment = snapshot.get("assessment") or {}
+    dyn = [s for s in assessment.get("next_steps", []) if isinstance(s, dict) and s.get("title")]
+    next_steps = (sorted(dyn, key=lambda s: s.get("priority", 5))
+                  if dyn else _next_steps(assets, findings))
     return {
         "phase": phase,
         "assets": assets,
         "findings_summary": sev,
         "flags": assets["flags"],
-        "next_steps": _next_steps(assets, findings),
+        "next_steps": next_steps,
+        "assessment": {"summary": assessment.get("summary", ""),
+                       "assets": assessment.get("assets", []),
+                       "dynamic": bool(dyn)},
         "checklist": _checklist(phase, assets, findings),
         "notes": snapshot.get("notes", []),
         "tasks": snapshot.get("tasks", []),
