@@ -669,6 +669,33 @@ def test_llm_extract_json_handles_fences():
     assert llm_extract._extract_json("not json") == {}
 
 
+def test_analysis_anomalies_become_findings_and_tasks():
+    from aggregator import llm_extract
+    counts = llm_extract.merge({
+        "summary": "encryption challenge page",
+        "anomalies": [{
+            "observation": "long hex strings under 'Previous Messages' + a Message key field",
+            "why_abnormal": "ciphertext shouldn't be exposed; key field implies a cipher",
+            "hypothesis": "messages are XOR-encrypted with the Message key",
+            "severity": "high",
+            "next_action": "hex-decode a message and XOR with the key"}]},
+        source="web-page")
+    assert counts["anomalies"] == 1
+    fs = STATE.get_findings()
+    assert any(f["rule"] == "anomaly" and f["severity"] == "high" for f in fs)
+    assert any("XOR" in t["text"] or "XOR" in t["text"].upper() for t in STATE.tasks)
+
+
+def test_file_tools_read_list(tmp_path):
+    f = tmp_path / "hosts"
+    f.write_text("127.0.0.1 localhost\n10.10.10.5 target.htb\n")
+    out = _run(tools.run_tool("read_file", {"path": str(f)}))
+    assert "target.htb" in out
+    assert "error" in _run(tools.run_tool("read_file", {"path": str(tmp_path / "nope")}))
+    listing = _run(tools.run_tool("list_dir", {"path": str(tmp_path)}))
+    assert "hosts" in listing
+
+
 def test_llm_extract_merges_into_kb():
     from aggregator import llm_extract
     counts = llm_extract.merge({"tool": "nmap", "hosts": [

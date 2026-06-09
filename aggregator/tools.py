@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import subprocess
 from typing import Any
 
@@ -63,6 +65,20 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "record_flag",
      "description": "Record a captured flag for this session.",
      "properties": {"flag": {"type": "string"}}, "required": ["flag"]},
+    {"name": "read_file",
+     "description": "Read a local file (e.g. /etc/hosts, a config, source, loot, scan "
+                    "output) to understand the real environment. Read-only; use this "
+                    "instead of a shell cat.",
+     "properties": {"path": {"type": "string"},
+                    "max_bytes": {"type": "integer", "description": "default 20000"}},
+     "required": ["path"]},
+    {"name": "list_dir",
+     "description": "List a local directory to see what files exist (instead of shell ls).",
+     "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    {"name": "grep_files",
+     "description": "Search a regex across files under a directory (instead of shell grep).",
+     "properties": {"pattern": {"type": "string"}, "path": {"type": "string"}},
+     "required": ["pattern", "path"]},
     {"name": "lookup_vulns",
      "description": "Look up known CVEs for a software product + version (live NVD "
                     "+ CISA known-exploited catalog). Use on discovered service versions.",
@@ -180,6 +196,43 @@ async def run_tool(name: str, args: dict[str, Any], allow_exec: bool = False) ->
         if name == "record_flag":
             return "flag recorded" if STATE.add_flag(args.get("flag", "")) else "already recorded"
 
+        if name == "read_file":
+            path = os.path.expanduser(args.get("path", ""))
+            n = int(args.get("max_bytes", 20000) or 20000)
+            try:
+                with open(path, "rb") as fh:
+                    raw = fh.read(n + 1)
+            except OSError as e:
+                return f"error reading {path}: {e}"
+            truncated = len(raw) > n
+            try:
+                text = raw[:n].decode("utf-8")
+            except UnicodeDecodeError:
+                return f"{path}: binary file ({len(raw)} bytes); not shown"
+            return f"--- {path} ---\n{text}" + ("\n…(truncated)" if truncated else "")
+
+        if name == "list_dir":
+            path = os.path.expanduser(args.get("path", "."))
+            try:
+                entries = sorted(os.listdir(path))
+            except OSError as e:
+                return f"error listing {path}: {e}"
+            rows = []
+            for e in entries[:300]:
+                full = os.path.join(path, e)
+                rows.append(f"{'d' if os.path.isdir(full) else '-'} {e}")
+            return f"--- {path} ---\n" + "\n".join(rows)
+
+        if name == "grep_files":
+            pattern, path = args.get("pattern", ""), os.path.expanduser(args.get("path", "."))
+            argv = (["rg", "-n", "--no-heading", "-S", pattern, path] if shutil.which("rg")
+                    else ["grep", "-rnI", "-e", pattern, path])
+            try:
+                out = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            except (OSError, subprocess.SubprocessError) as e:
+                return f"error: {e}"
+            return (out.stdout or out.stderr or "no matches")[:5000]
+
         if name == "lookup_vulns":
             from . import vulndb
             res = await vulndb.lookup(args.get("product", ""), args.get("version", ""))
@@ -199,7 +252,9 @@ async def run_tool(name: str, args: dict[str, Any], allow_exec: bool = False) ->
         if name == "run_command":
             if not allow_exec:
                 return ("execution is disabled — the operator must enable the 'allow run' "
-                        "toggle before commands can run. Suggest the command instead.")
+                        "toggle. If you only need to READ a file, use read_file/list_dir/"
+                        "grep_files instead (those don't require execution). Otherwise "
+                        "suggest the command for the operator to run.")
             target = _tmux_send(args.get("pane"), args["command"])
             if target.startswith("error"):
                 return target

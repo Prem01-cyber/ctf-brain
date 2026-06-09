@@ -117,10 +117,14 @@ the default port.) Findings from both feeds are deduped, so running both is fine
 
 The footer has a small toolbar:
 
-- **🤖 agent** — agent mode. The model can call tools to *investigate*, not just
-  advise: `list_findings`, `get_inventory`, `get_flow` (pull a captured request's
-  full body), `decode`, and `http_request` (send a request and read the response).
-  Tool calls show inline as `🔧 tool(args)`.
+- **🤖 agent** — a **ReAct loop**: the model reasons, takes one action, observes
+  the result, reasons again, and repeats until it can give a clearly-marked
+  **Answer:** — refining as it goes (one tool per step, no batched guessing). The
+  whole trace renders live in the chat: `💭` thought (summarized thinking on
+  Anthropic), `🔧` action (tool call), `📄` observation (result). Tools let it
+  *investigate*, not just advise: `read_file`/`list_dir`/`grep_files` (inspect the
+  real box — `/etc/hosts`, configs, source), `decode`, `http_request`,
+  `lookup_vulns`, `get_flow`, `list_findings`, `parse_output`.
 - **▶ run** — additionally lets the agent run a command in your **active tmux pane**
   (`nmap`, `ffuf`, `curl`…) and read the output. Off by default; enabling it is an
   explicit opt-in (and implies agent mode). Only enable on a box/engagement where
@@ -146,23 +150,22 @@ enumeration → exploitation → post-exploitation) and names the current phase.
 
 ## Cockpit: dynamic engagement tracking (the dashboard)
 
-### Automatic extraction pipeline
+### Dynamic analysis — observe → search → claim
 
-Everything you do is mined into an accumulating, persisted **knowledge base** — no
-manual entry:
+The intelligence is **not a hardcoded ruleset**. When a tmux pane settles or you
+open a page, an LLM analyst ([llm_extract.py](aggregator/llm_extract.py))
+**observes** the content and judges — in context — what is *abnormal or worth
+pulling on*: a hash or an encoded/encrypted blob sitting on a page, a "key" field
+next to ciphertext, a hidden form, a debug message, an odd parameter. For each it
+records the observation, *why* it's abnormal, a hypothesis, and the concrete next
+action — surfaced as **Signals** (right panel) + auto-created **tasks**. Nothing
+about "what counts as interesting" is hardcoded; the model decides.
 
-- **LLM-parsed tool output** ([llm_extract.py](aggregator/llm_extract.py)) — tool
-  output isn't standardized, so instead of brittle regex we hand a pane's output
-  to the model and get back structured **hosts → ports → service → version**,
-  endpoints, creds, and notes. Works for *any* tool (nmap, gobuster, nikto,
-  enum4linux…). Triggers automatically when a pane's output **stabilizes** (a few
-  seconds unchanged) and on-demand via the **parse pane** button / agent tool.
-  (A fast regex nmap parser in [extract.py](aggregator/extract.py) runs too as a
-  zero-cost first pass.)
-- **Artifacts from any text** — password hashes (bcrypt/sha-crypt/argon2 + bare
-  MD5/SHA1/256/512/NTLM), credentials, emails — extracted, deduped, surfaced as
-  both **artifacts** (knowledge base) and **findings** (alerts). (These *are*
-  fixed formats, so regex is reliable and free here.)
+It also structures the same content into the **knowledge base**: hosts → ports →
+service → version (any tool — nmap, gobuster, nikto…), endpoints, credentials.
+Triggers automatically (debounced) and on-demand via **parse pane**. A cheap regex
+pass still extracts fixed-format secrets (hashes/crypt strings) for free as a
+first signal, but the *judgment* of what matters is the model's.
 
 ### Vulnerability intelligence (version → CVE → exploit)
 
@@ -183,9 +186,12 @@ or the agent's `lookup_vulns` tool. Set `NVD_API_KEY` for a higher rate limit;
 
 ### The dashboard
 
-The right-hand **dashboard** turns the chat into a pentest cockpit. It's driven by
-a dynamic engagement model ([engagement.py](aggregator/engagement.py)) — *not* a
-fixed checklist — recomputed from live state:
+Two side panels flank the chat (a cockpit, not a single chat column): the **left**
+holds recon/intel (phase, hosts/services + CVEs, assets, artifacts); the **right**
+holds action/tracking — a live **⚡ Signals** card (the dynamically-flagged
+abnormals + why), next steps, flags, tasks, notes. It's driven by a dynamic
+engagement model ([engagement.py](aggregator/engagement.py)) — *not* a fixed
+checklist — recomputed from live state:
 
 - **Phase** — inferred from evidence (ports → Scanning, endpoints/params → Enumeration,
   SQL errors / `alg:none` JWTs → Exploitation) with a phase strip showing progress.

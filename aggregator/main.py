@@ -19,7 +19,22 @@ import time
 from . import (budget, config, decoders, detect, engagement, extract, llm,
                methodology, providers, screenshot, tools, vulndb)
 
+import logging
+
+_log = logging.getLogger("ctf-brain")
 _vuln_sem = asyncio.Semaphore(2)  # be gentle with the NVD rate limit
+
+
+def _bg(coro) -> None:
+    """Schedule a background task and log (don't swallow) any exception."""
+    task = asyncio.ensure_future(coro)
+
+    def _done(t):
+        exc = t.exception()
+        if exc:
+            _log.error("background task failed: %r", exc)
+
+    task.add_done_callback(_done)
 
 
 async def _lookup_one(host: str, port_key: str, banner: str) -> None:
@@ -32,19 +47,42 @@ def schedule_vuln_lookups() -> None:
     if not config.VULN_LOOKUP:
         return
     for host, port_key, banner in STATE.pending_vuln_lookups():
-        asyncio.ensure_future(_lookup_one(host, port_key, banner))
+        _bg(_lookup_one(host, port_key, banner))
 
 
 # Per-pane debounce state for auto LLM-parsing: key -> {hash, since, parsed}.
 _pane_track: dict[str, dict[str, Any]] = {}
 
 
-async def _parse_and_merge(text: str) -> dict[str, Any]:
+_analyzed_hashes: set[str] = set()
+
+
+async def _parse_and_merge(text: str, source: str = "tool-output") -> dict[str, Any]:
     from . import llm_extract
-    data = await llm_extract.parse_output(text)
-    counts = llm_extract.merge(data)
+    data = await llm_extract.analyze(text, source)
+    counts = llm_extract.merge(data, source)
     schedule_vuln_lookups()  # new service versions → CVE lookups
     return counts
+
+
+async def maybe_analyze_browser(payload: dict[str, Any]) -> None:
+    """Dynamically analyze an opened page once (deduped by url+content) — the model
+    decides if anything on it is abnormal/interesting and worth progressing."""
+    if not config.AUTO_PARSE or not llm.has_api_key():
+        return
+    import hashlib
+    body = (payload.get("bodyText") or "")
+    url = payload.get("url", "")
+    if len(body) < 120:
+        return
+    h = hashlib.md5((url + body[:4000]).encode("utf-8", "replace")).hexdigest()
+    if h in _analyzed_hashes:
+        return
+    _analyzed_hashes.add(h)
+    if len(_analyzed_hashes) > 500:
+        _analyzed_hashes.clear()
+    text = f"URL: {url}\nTITLE: {payload.get('title', '')}\n\n{body}"
+    _bg(_parse_and_merge(text, "web-page"))
 
 
 async def maybe_parse_pane(panes: dict[str, Any]) -> None:
@@ -64,7 +102,7 @@ async def maybe_parse_pane(panes: dict[str, Any]) -> None:
             continue
         if h != t["parsed"] and (now - t["since"]) >= config.PARSE_STABLE_SECONDS:
             t["parsed"] = h
-            asyncio.ensure_future(_parse_and_merge(content))
+            _bg(_parse_and_merge(content))
 from .state import STATE
 
 @contextlib.asynccontextmanager
@@ -165,11 +203,13 @@ async def recv_browser(payload: dict[str, Any]) -> dict[str, Any]:
     if not STATE.in_scope(payload.get("url", "")):
         return {"ok": True, "skipped": "out-of-scope"}
     STATE.set_browser(payload)
-    # Auto-extract artifacts from the visible page + selection.
+    # Cheap signal pass (hashes/encoded blobs), then a dynamic LLM analysis that
+    # judges whether anything on the page is abnormal/worth progressing.
     text = (payload.get("bodyText") or "") + "\n" + (payload.get("selected") or "")
     arts = extract.extract_artifacts(text, "browser")
     STATE.add_artifacts(arts)
     STATE.add_findings(extract.artifacts_to_findings(arts, payload.get("url", "")))
+    await maybe_analyze_browser(payload)
     return {"ok": True}
 
 

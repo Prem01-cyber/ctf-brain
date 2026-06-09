@@ -1,9 +1,11 @@
-"""LLM-based parsing of arbitrary tool output.
+"""Dynamic LLM analysis of observed content (tool output or a web page).
 
-Tool output isn't standardized (nmap, gobuster, ffuf, nikto, enum4linux, …), so
-instead of brittle per-tool regex we hand the text to the model and ask for a
-structured JSON object, then merge it into the knowledge base. Used both
-on-demand and automatically when a tmux pane's output stabilizes.
+Rather than a hardcoded ruleset deciding what matters, the model OBSERVES the
+content, decides what is *abnormal or interesting* for a CTF/pentest, forms a
+hypothesis, and proposes how to progress it — then we record those as findings,
+tasks, and structured assets. Nothing about "what counts as interesting" is
+hardcoded; the model judges it in context. Used automatically when a tmux pane
+or a web page settles, and on demand.
 """
 from __future__ import annotations
 
@@ -14,23 +16,34 @@ from typing import Any
 from . import providers
 from .state import STATE
 
-_PROMPT = """You are a parser for penetration-testing tool output. Read the text \
-below (it may be from nmap, gobuster, ffuf, nikto, enum4linux, dirb, a shell, etc.) \
-and extract what's useful. Return ONLY a JSON object, no prose, with this shape:
+_PROMPT = """You are an expert CTF / penetration-testing analyst observing live \
+content from the operator's session — it may be tool output (nmap, gobuster, …) or \
+the text of a web page they just opened.
 
+Think like an analyst: what here is *out of place* or worth pulling on? Treat \
+anything abnormal as a signal, not noise — e.g. hashes, encoded/encrypted blobs \
+(long hex/base64), tokens, debug info, odd parameters or hidden fields, version \
+banners, comments that leak info, or a UI that hints at a mechanism (an encryption \
+form, a key field, an admin area). For each, say *why* it's abnormal, your best \
+hypothesis about what it is, and the concrete next action to confirm/exploit it. \
+Don't just list data — reason about what it lets us claim.
+
+Return ONLY a JSON object (no prose) with any of these keys you have content for:
 {
-  "tool": "<best guess of the tool, or empty>",
-  "hosts": [{"host": "<ip or hostname>", "ports": [
-      {"port": "<num>", "proto": "tcp|udp", "service": "<name>", "version": "<product + version, e.g. 'Apache httpd 2.4.49'>"}]}],
-  "endpoints": ["<discovered url paths>"],
+  "summary": "<one line: what is this content / what's going on>",
+  "hosts": [{"host": "<ip/hostname>", "ports": [{"port":"","proto":"tcp","service":"","version":"<exact product+version for CVE matching>"}]}],
+  "endpoints": ["<url paths>"],
   "credentials": ["user=<u>", "password=<p>"],
-  "hashes": ["<any password hashes>"],
-  "vulns": ["<any vulnerabilities the output itself reports>"],
-  "notes": ["<short, high-value observations worth tracking>"]
+  "anomalies": [{
+     "observation": "<what you noticed, with the concrete value/snippet>",
+     "why_abnormal": "<why this shouldn't normally be here / why it matters>",
+     "hypothesis": "<what you think it is, e.g. 'hex looks XOR-encrypted with the Message key field'>",
+     "severity": "high|medium|low",
+     "next_action": "<exact command or step to progress it>"
+  }],
+  "notes": ["<short high-value observations to track>"]
 }
-
-Omit keys you have nothing for. Use the exact product+version string in "version" \
-so it can be matched against a CVE database. Do not invent data. TEXT:
+Do not invent data; ground every claim in the text. CONTENT:
 ---
 """
 
@@ -61,8 +74,8 @@ def _extract_json(raw: str) -> dict[str, Any]:
     return {}
 
 
-async def parse_output(text: str) -> dict[str, Any]:
-    """LLM-parse arbitrary tool output into a structured dict (or {} if no key)."""
+async def analyze(text: str, source: str = "content") -> dict[str, Any]:
+    """Have the model observe content and judge what's abnormal/interesting."""
     text = (text or "").strip()
     if not text:
         return {}
@@ -72,12 +85,18 @@ async def parse_output(text: str) -> dict[str, Any]:
         if provider is None:
             return {}
     raw = await provider.complete(
-        "You output only JSON. No explanations.", _PROMPT + text[:20000])
+        "You output only JSON. No explanations.",
+        _PROMPT + f"(source: {source})\n" + text[:20000])
     return _extract_json(raw)
 
 
-def merge(data: dict[str, Any]) -> dict[str, int]:
-    """Merge a parsed result into the knowledge base. Returns merge counts."""
+# Back-compat alias.
+parse_output = analyze
+
+
+def merge(data: dict[str, Any], source: str = "analysis") -> dict[str, int]:
+    """Merge an analysis result into the knowledge base. Anomalies become findings
+    (severity judged by the model) + tasks; assets merge into the KB."""
     if not isinstance(data, dict):
         return {}
     hosts = []
@@ -96,15 +115,32 @@ def merge(data: dict[str, Any]) -> dict[str, int]:
                           "ports": ports, "os": ""})
     n_hosts = STATE.merge_hosts(hosts) if hosts else 0
 
-    arts = []
-    for c in data.get("credentials", []) or []:
-        arts.append({"type": "credential", "value": str(c)[:200], "confidence": "medium",
-                     "source": "parsed", "context": data.get("tool", "")})
-    for hsh in data.get("hashes", []) or []:
-        arts.append({"type": "hash", "value": str(hsh)[:200], "confidence": "medium",
-                     "source": "parsed", "context": data.get("tool", "")})
+    arts = [{"type": "credential", "value": str(c)[:200], "confidence": "medium",
+             "source": source, "context": ""} for c in data.get("credentials", []) or []]
     n_arts = STATE.add_artifacts(arts) if arts else 0
 
-    for note in (data.get("notes", []) or [])[:10]:
-        STATE.add_note(f"[{data.get('tool', 'parsed')}] {note}")
-    return {"hosts": n_hosts, "artifacts": n_arts}
+    # Model-judged anomalies → findings (dynamic, not rule-based) + follow-up tasks.
+    findings, n_anom = [], 0
+    for a in data.get("anomalies", []) or []:
+        if not isinstance(a, dict) or not a.get("observation"):
+            continue
+        sev = a.get("severity", "medium")
+        sev = sev if sev in ("high", "medium", "low") else "medium"
+        obs = str(a["observation"])[:200]
+        findings.append({
+            "severity": sev, "category": "analysis", "rule": "anomaly",
+            "title": obs, "method": "", "url": "", "source": source,
+            "where": source,
+            "evidence": f"{a.get('why_abnormal', '')} | hypothesis: {a.get('hypothesis', '')}"[:280],
+            "key": f"anomaly|{obs[:80]}",
+        })
+        if a.get("next_action"):
+            STATE.add_task(f"{obs[:60]} → {str(a['next_action'])[:160]}")
+        n_anom += 1
+    STATE.add_findings(findings)
+
+    for note in (data.get("notes", []) or [])[:8]:
+        STATE.add_note(f"[{source}] {note}")
+    if data.get("summary"):
+        STATE.add_note(f"[{source}] {str(data['summary'])[:200]}")
+    return {"hosts": n_hosts, "artifacts": n_arts, "anomalies": n_anom}

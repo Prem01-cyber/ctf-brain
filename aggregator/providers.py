@@ -34,6 +34,12 @@ def _openai_tools() -> list[dict[str, Any]]:
                        "required": t["required"]}}} for t in tools.TOOLS]
 
 
+def _obs(text: str) -> str:
+    """One-line observation preview for the UI (the full result still goes to the model)."""
+    t = " ".join(str(text).split())
+    return t[:240] + ("…" if len(t) > 240 else "")
+
+
 # --- image attachment helpers (format differs per provider) ----------------
 def attach_image_anthropic(messages: list[dict[str, Any]], image_b64: str) -> list[dict[str, Any]]:
     """Add the screenshot to the last user turn as an Anthropic image block."""
@@ -143,16 +149,26 @@ class AnthropicProvider(Provider):
         try:
             client = anthropic.AsyncAnthropic()
             for _ in range(_MAX_AGENT_ITERS):
-                # Thinking disabled in agent mode to avoid thinking-block re-submission.
+                # Adaptive thinking, summarized so the reasoning is visible (Claude
+                # Code style). Thinking blocks are preserved in the assistant turn
+                # so the tool-use continuation stays valid.
                 resp = await client.messages.create(
                     model=config.MODEL, max_tokens=config.MAX_OUTPUT_TOKENS,
                     system=system, messages=msgs, tools=atools,
-                    thinking={"type": "disabled"},
+                    thinking={"type": "adaptive", "display": "summarized"},
+                    tool_choice={"type": "auto", "disable_parallel_tool_use": True},
                 )
                 assistant: list[dict[str, Any]] = []
                 tool_uses = []
                 for b in resp.content:
-                    if b.type == "text":
+                    if b.type == "thinking":
+                        if getattr(b, "thinking", ""):
+                            yield f"\n💭 {b.thinking}\n"
+                        assistant.append({"type": "thinking", "thinking": b.thinking,
+                                          "signature": getattr(b, "signature", "")})
+                    elif b.type == "redacted_thinking":
+                        assistant.append({"type": "redacted_thinking", "data": b.data})
+                    elif b.type == "text":
                         if b.text:
                             yield b.text
                         assistant.append({"type": "text", "text": b.text})
@@ -167,6 +183,7 @@ class AnthropicProvider(Provider):
                 for tu in tool_uses:
                     yield f"\n🔧 {tu.name}({json.dumps(tu.input)[:120]})\n"
                     out = await tools.run_tool(tu.name, tu.input, allow_exec)
+                    yield f"📄 {_obs(out)}\n"
                     results.append({"type": "tool_result", "tool_use_id": tu.id,
                                     "content": out})
                 msgs.append({"role": "user", "content": results})
@@ -253,7 +270,7 @@ class OpenAIProvider(Provider):
             client = AsyncOpenAI(base_url=config.OPENAI_BASE_URL)
             for _ in range(_MAX_AGENT_ITERS):
                 resp = await self._create(client, model=config.MODEL, messages=msgs,
-                                          tools=otools)
+                                          tools=otools, parallel_tool_calls=False)
                 msg = resp.choices[0].message
                 if msg.content:
                     yield msg.content
@@ -272,6 +289,7 @@ class OpenAIProvider(Provider):
                         args = {}
                     yield f"\n🔧 {tc.function.name}({json.dumps(args)[:120]})\n"
                     out = await tools.run_tool(tc.function.name, args, allow_exec)
+                    yield f"📄 {_obs(out)}\n"
                     msgs.append({"role": "tool", "tool_call_id": tc.id, "content": out})
             yield "\n[ctf-brain] agent reached max iterations."
         except openai.APIStatusError as e:
